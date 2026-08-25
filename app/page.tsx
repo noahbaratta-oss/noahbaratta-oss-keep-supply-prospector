@@ -1,14 +1,15 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 const STATES = ["All Western States", "Arizona", "California", "Colorado", "Idaho", "Montana", "Nevada", "New Mexico", "Oregon", "Utah", "Washington", "Wyoming", "Alaska", "Hawaii"];
+const MEMORY_KEY = "keep-supply-prospect-memory-v1";
 
 type Prospect = {
   name: string; city: string; state: string; industry: string; refrigeration: string;
   ammonia: "Confirmed" | "Likely" | "Unknown" | "None indicated";
   ammoniaLb?: number | null; score: number; priority: "A" | "B" | "C";
-  reason: string; sourceUrls?: string[];
+  reason: string; sourceUrls?: string[]; isNew?: boolean;
 };
 
 const seedProspects: Prospect[] = [
@@ -24,17 +25,34 @@ const seedProspects: Prospect[] = [
   { name: "Multistar Industries", city: "Othello", state: "Washington", industry: "Storage / distribution", refrigeration: "Industrial refrigeration", ammonia: "Confirmed", ammoniaLb: 10000, score: 77, priority: "B", reason: "EPA documentation identifies more than 10,000 lb of stored anhydrous ammonia; refrigeration fit requires facility-level confirmation." }
 ];
 
+function keyFor(p: Pick<Prospect, "name" | "city" | "state">) {
+  return `${p.name}|${p.city}|${p.state}`.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
 export default function Home() {
   const [state, setState] = useState(STATES[0]);
   const [query, setQuery] = useState("");
   const [ammoniaOnly, setAmmoniaOnly] = useState(false);
   const [minScore, setMinScore] = useState(70);
   const [prospects, setProspects] = useState<Prospect[]>(seedProspects);
+  const [memory, setMemory] = useState<Record<string, number>>({});
   const [selected, setSelected] = useState<Prospect | null>(null);
   const [researching, setResearching] = useState(false);
   const [discovering, setDiscovering] = useState(false);
+  const [progress, setProgress] = useState("");
   const [researchText, setResearchText] = useState("");
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(MEMORY_KEY);
+      const saved = raw ? JSON.parse(raw) : {};
+      if (saved && typeof saved === "object") setMemory(saved);
+      setProspects(seedProspects.map(p => ({ ...p, isNew: !(saved?.[keyFor(p)]) })));
+    } catch {
+      setProspects(seedProspects.map(p => ({ ...p, isNew: false })));
+    }
+  }, []);
 
   const filtered = useMemo(() => prospects.filter(p =>
     (state === STATES[0] || p.state === state) &&
@@ -44,6 +62,27 @@ export default function Home() {
   ).sort((a,b) => b.score - a.score), [state, query, ammoniaOnly, minScore, prospects]);
 
   const ammonia10k = filtered.filter(p => p.ammonia === "Confirmed" && (p.ammoniaLb === null || (p.ammoniaLb ?? 0) >= 10000)).length;
+  const newCount = filtered.filter(p => p.isNew).length;
+  const territoryMemoryCount = Object.keys(memory).length;
+
+  function remember(newItems: Prospect[]) {
+    const next = { ...memory };
+    for (const p of newItems) next[keyFor(p)] = Date.now();
+    setMemory(next);
+    try { localStorage.setItem(MEMORY_KEY, JSON.stringify(next)); } catch { /* browser storage may be disabled */ }
+    return next;
+  }
+
+  function mergeProspects(incoming: Prospect[], nextMemory: Record<string, number>) {
+    const map = new Map<string, Prospect>();
+    for (const p of prospects) map.set(keyFor(p), { ...p, isNew: !nextMemory[keyFor(p)] });
+    for (const p of incoming) {
+      const k = keyFor(p);
+      const prior = map.get(k);
+      map.set(k, { ...p, isNew: !nextMemory[k] || !prior?.isNew });
+    }
+    return [...map.values()].sort((a,b) => b.score - a.score);
+  }
 
   async function researchProspect(p: Prospect) {
     setSelected(p); setResearchText(""); setError(""); setResearching(true);
@@ -52,19 +91,24 @@ export default function Home() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Research failed");
       setResearchText(data.dossier || "No dossier returned.");
+      const nextMemory = remember([p]);
+      setProspects(current => current.map(x => keyFor(x) === keyFor(p) ? { ...x, isNew: false } : x));
+      setMemory(nextMemory);
     } catch (e) { setError(e instanceof Error ? e.message : "Research failed"); }
     finally { setResearching(false); }
   }
 
   async function discoverTerritory() {
-    setError(""); setDiscovering(true); setResearchText(""); setSelected(null);
+    setError(""); setDiscovering(true); setResearchText(""); setSelected(null); setProgress("Starting territory sweep…");
     try {
-      const res = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "discover", state }) });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Discovery failed");
-      if (Array.isArray(data.prospects) && data.prospects.length) {
-        const normalized = data.prospects.map((p: Partial<Prospect>, i: number) => ({
-          name: p.name || `Web-discovered prospect ${i+1}`,
+      const first = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "discover", state, batch: 0 }) });
+      const firstData = await first.json();
+      if (!first.ok) throw new Error(firstData.error || "Discovery failed");
+      const totalBatches = Number(firstData.totalBatches) || 1;
+      let allIncoming: Prospect[] = [];
+      const processBatch = (data: any) => {
+        const normalized = Array.isArray(data.prospects) ? data.prospects.map((p: Partial<Prospect>, i: number) => ({
+          name: p.name || `Web-discovered prospect ${allIncoming.length + i + 1}`,
           city: p.city || "Unknown",
           state: p.state || (state === STATES[0] ? "Western U.S." : state),
           industry: p.industry || "Industrial facility",
@@ -73,15 +117,31 @@ export default function Home() {
           ammoniaLb: typeof p.ammoniaLb === "number" ? p.ammoniaLb : null,
           score: Math.max(0, Math.min(100, Number(p.score) || 50)),
           priority: p.priority === "A" || p.priority === "B" || p.priority === "C" ? p.priority : "B",
-          reason: p.reason || "Identified through live web research; facility-level verification still recommended.",
+          reason: p.reason || "Identified through public web research; facility-level verification still recommended.",
           sourceUrls: Array.isArray(p.sourceUrls) ? p.sourceUrls : []
-        })) as Prospect[];
-        setProspects(prev => [...normalized, ...prev]);
-      } else if (data.raw) {
-        setResearchText(data.raw);
+        })) as Prospect[] : [];
+        allIncoming = [...allIncoming, ...normalized];
+        return normalized;
+      };
+      processBatch(firstData);
+      setProgress(`Scanned batch 1 of ${totalBatches}… found ${allIncoming.length} candidates.`);
+
+      for (let batch = 1; batch < totalBatches; batch++) {
+        const res = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "discover", state, batch }) });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Discovery failed on batch ${batch + 1}`);
+        processBatch(data);
+        setProgress(`Scanned batch ${batch + 1} of ${totalBatches}… found ${allIncoming.length} candidates.`);
       }
-    } catch (e) { setError(e instanceof Error ? e.message : "Discovery failed"); }
-    finally { setDiscovering(false); }
+
+      const nextMemory = remember(allIncoming);
+      setProspects(current => mergeProspects(allIncoming, nextMemory));
+      setMemory(nextMemory);
+      setProgress(`Sweep complete. Found ${allIncoming.length} raw candidates and saved them to territory memory.`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Discovery failed");
+      setProgress("");
+    } finally { setDiscovering(false); }
   }
 
   return (
@@ -89,7 +149,7 @@ export default function Home() {
       <header className="header">
         <div>
           <div className="eyebrow">KEEP SUPPLY</div>
-          <h1>AI Prospecting Engine</h1>
+          <h1>Prospecting Engine</h1>
           <p>Industrial refrigeration first. Ammonia is a qualifier—not a requirement.</p>
         </div>
         <div className="pill">WESTERN U.S.</div>
@@ -102,13 +162,17 @@ export default function Home() {
         <label className="check"><input type="checkbox" checked={ammoniaOnly} onChange={e=>setAmmoniaOnly(e.target.checked)} /> Ammonia only</label>
       </section>
 
-      <section className="actions"><button className="primary" onClick={discoverTerritory} disabled={discovering}>{discovering ? "Researching the web…" : `Find new prospects ${state === STATES[0] ? "across the West" : `in ${state}`}`}</button><span>Live discovery searches public web sources and applies refrigeration-first qualification. No Google Places key required.</span></section>
+      <section className="actions">
+        <button className="primary" onClick={discoverTerritory} disabled={discovering}>{discovering ? "Scanning…" : `Find new prospects ${state === STATES[0] ? "across the West" : `in ${state}`}`}</button>
+        <span>{progress || "Public-web discovery runs in short batches so it works on the free Vercel tier. Territory memory is saved in this browser."}</span>
+      </section>
 
       {error && <div className="errorBox">{error}</div>}
       <section className="stats">
         <div className="stat"><span>Qualified refrigeration prospects</span><strong>{filtered.length}</strong></div>
+        <div className="stat"><span>New in this territory view</span><strong>{newCount}</strong></div>
+        <div className="stat"><span>Territory memory saved</span><strong>{territoryMemoryCount}</strong></div>
         <div className="stat"><span>Ammonia 10k+ / evidence class</span><strong>{ammonia10k}</strong></div>
-        <div className="stat"><span>Coverage states</span><strong>{state === STATES[0] ? 13 : 1}</strong></div>
       </section>
 
       <section className="note"><strong>Scoring rule:</strong> non-ammonia industrial refrigeration can score highly. The 10,000-lb test is applied only when ammonia evidence exists.</section>
@@ -119,7 +183,7 @@ export default function Home() {
           <tbody>
             {filtered.map(p => <tr key={`${p.name}-${p.city}`} onClick={()=>setSelected(p)}>
               <td><span className={`score s${p.score >= 90 ? "high" : p.score >= 80 ? "mid" : "low"}`}>{p.score}</span></td>
-              <td><strong>{p.name}</strong></td><td>{p.city}, {p.state}</td><td>{p.industry}</td><td>{p.refrigeration}</td>
+              <td><strong>{p.name}</strong>{p.isNew ? <small> • NEW</small> : ""}</td><td>{p.city}, {p.state}</td><td>{p.industry}</td><td>{p.refrigeration}</td>
               <td>{p.ammonia === "None indicated" ? "—" : p.ammonia}{p.ammonia === "Confirmed" && p.ammoniaLb ? <small> • ≥10k</small> : ""}</td>
               <td><span className={`priority p${p.priority}`}>{p.priority}</span></td>
               <td><button className="mini" onClick={e=>{e.stopPropagation(); researchProspect(p)}}>Research</button></td>
