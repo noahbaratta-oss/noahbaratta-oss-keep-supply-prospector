@@ -1,16 +1,31 @@
+import { getToken } from "@vercel/connect";
 import { NextResponse } from "next/server";
 
-const MODEL = process.env.OPENAI_PROSPECTOR_MODEL || "gpt-5.6-luna";
+const MODEL = process.env.OPENAI_PROSPECTOR_MODEL || "gpt-5.4";
+const CONNECTOR = process.env.VERCEL_OPENAI_CONNECTOR || "api-key/keep-supply-openai";
 
 function cleanJson(text: string) {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   return fenced ? fenced[1] : text;
 }
 
+async function getOpenAIKey() {
+  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+  try {
+    return await getToken(CONNECTOR);
+  } catch {
+    return null;
+  }
+}
+
 export async function POST(req: Request) {
-  if (!process.env.OPENAI_API_KEY) {
+  const apiKey = await getOpenAIKey();
+  if (!apiKey) {
     return NextResponse.json(
-      { error: "Live research is not connected yet. Add OPENAI_API_KEY to the Vercel project Environment Variables." },
+      {
+        error:
+          "Live research is not connected. Connect OpenAI to this Vercel project with Vercel Connect (connector: keep-supply-openai), or add OPENAI_API_KEY in Production.",
+      },
       { status: 503 }
     );
   }
@@ -59,7 +74,7 @@ Be explicit about uncertainty and do not infer an ammonia charge merely because 
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
         model: MODEL,
