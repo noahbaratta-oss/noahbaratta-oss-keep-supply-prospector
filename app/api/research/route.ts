@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 
 const WESTERN_STATES = ["Arizona", "California", "Colorado", "Idaho", "Montana", "Nevada", "New Mexico", "Oregon", "Utah", "Washington", "Wyoming", "Alaska", "Hawaii"];
-const STATE_CODES: Record<string, string> = { Arizona: "AZ", California: "CA", Colorado: "CO", Idaho: "ID", Montana: "MT", Nevada: "NV", "New Mexico": "NM", Oregon: "OR", Utah: "UT", Washington: "WA", Wyoming: "WY", Alaska: "AK", Hawaii: "HI" };
-const UA = "KeepSupplyProspector/2.0 (public research tool)";
+const UA = "KeepSupplyProspector/2.1 (public research tool)";
 const SEARCH_TIMEOUT_MS = 2800;
 
 type SearchHit = { title: string; url: string; snippet: string };
@@ -13,15 +12,15 @@ type Prospect = {
   reason: string; sourceUrls: string[];
 };
 
-type SearchMode = { label: string; terms: string[]; suffix: string };
+type SearchMode = { label: string; terms: string[]; suffixes: string[] };
 const MODES: SearchMode[] = [
-  { label: "facility", terms: ["cold storage", "refrigerated warehouse", "cold chain", "temperature controlled warehouse", "frozen food warehouse", "refrigerated distribution"], suffix: "facility" },
-  { label: "food", terms: ["meat processing", "poultry processing", "seafood processing", "dairy plant", "cheese manufacturing", "ice cream manufacturing"], suffix: "industrial refrigeration" },
-  { label: "produce", terms: ["produce packing", "fruit packing", "potato processing", "vegetable processing", "apple storage", "cold chain produce"], suffix: "refrigeration" },
-  { label: "beverage", terms: ["brewery", "beverage manufacturing", "winery", "distillery", "food distribution", "frozen foods"], suffix: "refrigeration" },
-  { label: "industrial", terms: ["industrial refrigeration", "process cooling", "ammonia refrigeration", "CO2 refrigeration", "glycol refrigeration", "industrial freezer"], suffix: "plant" },
-  { label: "government", terms: ["refrigeration permit", "RMP ammonia", "PSM ammonia", "ammonia permit", "cold storage permit", "refrigeration inspection"], suffix: "site:gov" },
-  { label: "documents", terms: ["refrigeration filetype:pdf", "ammonia filetype:pdf", "cold storage filetype:pdf", "RMP filetype:pdf", "PSM filetype:pdf", "refrigeration plan filetype:pdf"], suffix: "" },
+  { label: "facility", terms: ["cold storage", "refrigerated warehouse", "cold chain", "temperature controlled warehouse", "frozen food warehouse", "refrigerated distribution", "cold warehouse", "freezer warehouse"], suffixes: ["facility", "company", "plant"] },
+  { label: "food", terms: ["meat processing", "poultry processing", "seafood processing", "dairy plant", "cheese manufacturing", "ice cream manufacturing", "food processing", "frozen food manufacturing"], suffixes: ["industrial refrigeration", "refrigeration", "cold storage"] },
+  { label: "produce", terms: ["produce packing", "fruit packing", "potato processing", "vegetable processing", "apple storage", "cold chain produce", "onion storage", "fresh produce warehouse"], suffixes: ["refrigeration", "cold storage", "facility"] },
+  { label: "beverage", terms: ["brewery", "beverage manufacturing", "winery", "distillery", "food distribution", "frozen foods", "beverage plant", "drink manufacturing"], suffixes: ["refrigeration", "cold storage", "industrial refrigeration"] },
+  { label: "industrial", terms: ["industrial refrigeration", "process cooling", "ammonia refrigeration", "CO2 refrigeration", "glycol refrigeration", "industrial freezer", "process chiller", "thermal processing"], suffixes: ["plant", "facility", "company"] },
+  { label: "government", terms: ["refrigeration permit", "RMP ammonia", "PSM ammonia", "ammonia permit", "cold storage permit", "refrigeration inspection", "environmental permit refrigeration", "facility risk management plan"], suffixes: ["site:gov", "site:state.us", "site:epa.gov"] },
+  { label: "documents", terms: ["refrigeration filetype:pdf", "ammonia filetype:pdf", "cold storage filetype:pdf", "RMP filetype:pdf", "PSM filetype:pdf", "refrigeration plan filetype:pdf", "facility permit filetype:pdf", "refrigeration engineering filetype:pdf"], suffixes: ["", "site:gov", "site:edu"] },
 ];
 
 function clean(s: string) {
@@ -96,15 +95,20 @@ async function search(query: string, offset: number) {
 function buildQueries(state: string, batch: number, sweep: number) {
   const states = state === "All Western States" ? WESTERN_STATES : [state];
   const mode = MODES[sweep % MODES.length];
-  const stateIndex = batch % states.length;
-  const rotated = [...states.slice(stateIndex), ...states.slice(0, stateIndex)];
-  const selectedStates = rotated.slice(0, Math.min(3, states.length));
-  const queryCount = 6;
-  const start = (Math.floor(batch / states.length) * queryCount) % mode.terms.length;
-  const terms = Array.from({ length: queryCount }, (_, i) => mode.terms[(start + i) % mode.terms.length]);
-  const offset = (Math.floor(batch / states.length) * 10) % 50;
-  const queries = selectedStates.flatMap((s) => terms.slice(0, 2).map((t) => `"${s}" ${t} ${mode.suffix}`));
-  return { queries, offset, totalBatches: state === "All Western States" ? 18 : 8, mode: mode.label };
+  const statePackSize = state === "All Western States" ? 5 : 1;
+  const stateStart = (batch * statePackSize) % states.length;
+  const selectedStates = Array.from({ length: Math.min(statePackSize, states.length) }, (_, i) => states[(stateStart + i) % states.length]);
+  const termsPerPack = 3;
+  const termStart = (Math.floor(batch / Math.max(1, Math.ceil(states.length / statePackSize))) * termsPerPack) % mode.terms.length;
+  const suffixStart = batch % mode.suffixes.length;
+  const queries = selectedStates.flatMap((s) => Array.from({ length: termsPerPack }, (_, i) => {
+    const term = mode.terms[(termStart + i) % mode.terms.length];
+    const suffix = mode.suffixes[(suffixStart + i) % mode.suffixes.length];
+    return `"${s}" ${term} ${suffix}`.trim();
+  }));
+  const offset = (batch * 10 + Math.floor(sweep / MODES.length) * 20) % 60;
+  const totalBatches = state === "All Western States" ? 10 : 4;
+  return { queries, offset, totalBatches, mode: mode.label };
 }
 function dedupe(items: Prospect[]) {
   const m = new Map<string, Prospect>();
@@ -125,7 +129,7 @@ export async function POST(req: Request) {
       const hitGroups = await Promise.all(cfg.queries.map((q) => search(q, cfg.offset)));
       const hits = hitGroups.flat();
       const candidates = dedupe(hits.map((h) => classify(h, state))).filter((p) => !knownKeys.has(keyFor(p)) && p.score >= 35);
-      return NextResponse.json({ mode, batch, totalBatches: cfg.totalBatches, sweep, searchMode: cfg.mode, hitCount: hits.length, prospects: candidates, raw: `${cfg.mode} sweep ${sweep + 1}, batch ${batch + 1}/${cfg.totalBatches}: ${hits.length} search hits → ${candidates.length} new candidates.` });
+      return NextResponse.json({ mode, batch, totalBatches: cfg.totalBatches, sweep, searchMode: cfg.mode, queryCount: cfg.queries.length, hitCount: hits.length, prospects: candidates, raw: `${cfg.mode} pack ${batch + 1}/${cfg.totalBatches}: ${cfg.queries.length} related searches, ${hits.length} hits → ${candidates.length} new candidates.` });
     }
     const p = body?.prospect || {};
     const name = p.name || "industrial refrigeration facility";
