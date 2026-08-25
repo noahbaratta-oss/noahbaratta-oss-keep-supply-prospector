@@ -1,30 +1,23 @@
-import { getToken } from "@vercel/connect";
 import { NextResponse } from "next/server";
 
-const MODEL = process.env.OPENAI_PROSPECTOR_MODEL || "gpt-5.4";
-const CONNECTOR = process.env.VERCEL_OPENAI_CONNECTOR || "api-key/keep-supply-openai";
+const MODEL = process.env.OPENAI_PROSPECTOR_MODEL || "openai/gpt-5.4";
+const AI_GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/responses";
 
 function cleanJson(text: string) {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   return fenced ? fenced[1] : text;
 }
 
-async function getOpenAIKey() {
-  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
-  try {
-    return await getToken(CONNECTOR);
-  } catch {
-    return null;
-  }
+function getGatewayToken() {
+  return process.env.AI_GATEWAY_API_KEY || process.env.VERCEL_OIDC_TOKEN || process.env.OPENAI_API_KEY || null;
 }
 
 export async function POST(req: Request) {
-  const apiKey = await getOpenAIKey();
-  if (!apiKey) {
+  const token = getGatewayToken();
+  if (!token) {
     return NextResponse.json(
       {
-        error:
-          "Live research is not connected. Connect OpenAI to this Vercel project with Vercel Connect (connector: keep-supply-openai), or add OPENAI_API_KEY in Production.",
+        error: "Live research backend is not available in this deployment. The app is configured for Vercel AI Gateway and needs its automatic Vercel OIDC credential or an AI Gateway key.",
       },
       { status: 503 }
     );
@@ -70,11 +63,11 @@ Return a concise research dossier with these headings:
 
 Be explicit about uncertainty and do not infer an ammonia charge merely because the facility is refrigerated.`;
 
-    const response = await fetch("https://api.openai.com/v1/responses", {
+    const response = await fetch(AI_GATEWAY_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({
         model: MODEL,
@@ -85,7 +78,7 @@ Be explicit about uncertainty and do not infer an ammonia charge merely because 
 
     const data = await response.json();
     if (!response.ok) {
-      return NextResponse.json({ error: data?.error?.message || "Web research request failed." }, { status: response.status });
+      return NextResponse.json({ error: data?.error?.message || "The live research provider rejected the request." }, { status: response.status });
     }
 
     const text = data?.output_text || "No research result was returned.";
@@ -101,6 +94,6 @@ Be explicit about uncertainty and do not infer an ammonia charge merely because 
 
     return NextResponse.json({ mode, dossier: text });
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Unexpected research error." }, { status: 500 });
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unexpected live research error." }, { status: 500 });
   }
 }
