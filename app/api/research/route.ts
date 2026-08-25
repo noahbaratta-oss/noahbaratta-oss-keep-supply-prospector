@@ -29,8 +29,19 @@ function stripHtml(input: string) {
     .replace(/&quot;/g, '"')
     .replace(/&#x27;|&#39;/g, "'")
     .replace(/&nbsp;/g, " ")
+    .replace(/&#x2F;/g, "/")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function decodeDdgUrl(raw: string) {
+  try {
+    const decoded = decodeURIComponent(raw);
+    const match = decoded.match(/[?&]uddg=([^&]+)/i);
+    return match ? decodeURIComponent(match[1]) : raw;
+  } catch {
+    return raw;
+  }
 }
 
 function titleToName(title: string) {
@@ -50,12 +61,13 @@ function classify(hit: SearchHit, stateHint: string): Prospect {
   const corpus = `${hit.title} ${hit.snippet}`.toLowerCase();
   const refrigerationTerms = [
     "industrial refrigeration", "refrigerated warehouse", "cold storage", "cold chain", "ammonia refrigeration",
-    "co2 refrigeration", "carbon dioxide refrigeration", "refrigeration system", "freezer", "freezing", "blast freezer",
+    "co2 refrigeration", "carbon dioxide refrigeration", "refrigeration system", "refrigeration plant", "freezer", "freezing", "blast freezer",
     "food processing", "meat processing", "poultry", "seafood", "dairy", "cheese", "ice cream", "produce packing",
-    "fruit packing", "beverage manufacturing", "brewery", "distillery", "refrigerated distribution"
+    "fruit packing", "beverage manufacturing", "brewery", "distillery", "refrigerated distribution", "temperature controlled",
+    "temperature-controlled", "frozen foods", "frozen food", "warehouse refrigeration", "process cooling", "chilled warehouse"
   ];
-  const strongFacilityTerms = ["cold storage", "food processing", "meat", "poultry", "seafood", "dairy", "cheese", "ice cream", "produce", "brewery", "refrigerated warehouse"];
-  const ammoniaTerms = ["ammonia", "anhydrous ammonia", "rmp ammonia", "psm ammonia"];
+  const strongFacilityTerms = ["cold storage", "food processing", "meat", "poultry", "seafood", "dairy", "cheese", "ice cream", "produce", "brewery", "refrigerated warehouse", "frozen foods", "refrigerated distribution"];
+  const ammoniaTerms = ["ammonia", "anhydrous ammonia", "rmp ammonia", "psm ammonia", "nh3"];
   const nonAmmoniaTerms = ["co2 refrigeration", "glycol", "hfc", "hcfc", "nh3/co2", "carbon dioxide refrigeration"];
 
   const refrigerationHits = refrigerationTerms.filter((t) => corpus.includes(t)).length;
@@ -66,11 +78,11 @@ function classify(hit: SearchHit, stateHint: string): Prospect {
   let score = 35 + Math.min(32, refrigerationHits * 5) + Math.min(16, strongHits * 4);
   if (ammoniaHits) score += 8;
   if (nonAmmoniaHits) score += 5;
-  if (/parts|maintenance|service|mechanical|hvac|refrigeration contractor/.test(corpus)) score += 4;
+  if (/parts|maintenance|service|mechanical|hvac|refrigeration contractor|facility maintenance/.test(corpus)) score += 4;
   score = Math.max(0, Math.min(100, score));
 
   const ammonia: Prospect["ammonia"] = ammoniaHits >= 2 ? "Confirmed" : ammoniaHits === 1 ? "Likely" : "None indicated";
-  const ammoniaLbMatch = corpus.match(/(?:over|more than|exceeding|at least|approximately|\b)(\d{1,3}(?:,\d{3})+|\d{5,})\s*(?:lb|lbs|pounds)\b[^.]{0,50}ammonia|ammonia[^.]{0,50}(\d{1,3}(?:,\d{3})+|\d{5,})\s*(?:lb|lbs|pounds)/i);
+  const ammoniaLbMatch = corpus.match(/(?:over|more than|exceeding|at least|approximately)\s*(\d{1,3}(?:,\d{3})+|\d{5,})\s*(?:lb|lbs|pounds)\b[^.]{0,80}ammonia|ammonia[^.]{0,80}(\d{1,3}(?:,\d{3})+|\d{5,})\s*(?:lb|lbs|pounds)/i);
   const ammoniaLb = ammoniaLbMatch ? Number((ammoniaLbMatch[1] || ammoniaLbMatch[2]).replace(/,/g, "")) : null;
   const { city, state } = guessCityState(`${hit.title} ${hit.snippet}`, stateHint === "All Western States" ? "Western U.S." : stateHint);
 
@@ -84,6 +96,43 @@ function classify(hit: SearchHit, stateHint: string): Prospect {
   return { name: titleToName(hit.title), city, state, industry, refrigeration, ammonia, ammoniaLb, score, priority, reason, sourceUrls: [hit.url] };
 }
 
+function parseDdgResults(html: string): SearchHit[] {
+  const hits: SearchHit[] = [];
+  const blocks = html.split(/<div[^>]+class=["'][^"']*result[^"']*["'][^>]*>/i).slice(1);
+  for (const block of blocks) {
+    if (hits.length >= 10) break;
+    const titleMatch = block.match(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i)
+      || block.match(/<a[^>]*href=["']([^"']+)["'][^>]*class=["'][^"']*result__a[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
+    if (!titleMatch) continue;
+    const snippetMatch = block.match(/<a[^>]+class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/a>/i)
+      || block.match(/<div[^>]+class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+    const rawUrl = titleMatch[1];
+    const url = decodeDdgUrl(rawUrl);
+    const title = stripHtml(titleMatch[2]);
+    const snippet = snippetMatch ? stripHtml(snippetMatch[1]) : "";
+    if (!title || !url || !/^https?:/i.test(url)) continue;
+    hits.push({ title, url, snippet });
+  }
+  return hits;
+}
+
+function parseDdgLinkFallback(html: string): SearchHit[] {
+  const hits: SearchHit[] = [];
+  const titles = [...html.matchAll(/<a[^>]*class=["'][^"']*result__a[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi)];
+  const snippets = [...html.matchAll(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi)].map((m) => stripHtml(m[1]));
+  for (let i = 0; i < titles.length && hits.length < 10; i += 1) {
+    const titleHtml = titles[i][1];
+    const start = titles[i].index ?? 0;
+    const before = html.slice(Math.max(0, start - 600), start + 600);
+    const hrefMatch = before.match(/href=["']([^"']+)["']/i);
+    const url = hrefMatch ? decodeDdgUrl(hrefMatch[1]) : "";
+    const title = stripHtml(titleHtml);
+    const snippet = snippets[i] || "";
+    if (title && /^https?:/i.test(url)) hits.push({ title, url, snippet });
+  }
+  return hits;
+}
+
 async function duckSearch(query: string): Promise<SearchHit[]> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
@@ -92,13 +141,9 @@ async function duckSearch(query: string): Promise<SearchHit[]> {
     const res = await fetch(url, { headers: { "User-Agent": UA }, cache: "no-store", signal: controller.signal });
     if (!res.ok) return [];
     const html = await res.text();
-    const hits: SearchHit[] = [];
-    const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(html)) && hits.length < 8) {
-      hits.push({ title: stripHtml(m[2]), url: m[1], snippet: stripHtml(m[3]) });
-    }
-    return hits;
+    const primary = parseDdgResults(html);
+    if (primary.length) return primary;
+    return parseDdgLinkFallback(html);
   } catch {
     return [];
   } finally {
@@ -156,7 +201,7 @@ export async function POST(req: Request) {
       const batches = await Promise.all(queries.map(duckSearch));
       const hits = batches.flat();
       const prospects = dedupeProspects(hits.map((h) => classify(h, state))).filter((p) => p.score >= 45);
-      return NextResponse.json({ mode, batch, totalBatches, prospects, raw: `Batch ${batch + 1} of ${totalBatches}: ${hits.length} public search results, ${prospects.length} candidates.` });
+      return NextResponse.json({ mode, batch, totalBatches, prospects, hitCount: hits.length, raw: `Batch ${batch + 1} of ${totalBatches}: ${hits.length} public search results, ${prospects.length} candidates.` });
     }
 
     const prospect = body?.prospect || {};
