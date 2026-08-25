@@ -1,115 +1,187 @@
-import { getVercelOidcToken } from "@vercel/oidc";
 import { NextResponse } from "next/server";
 
-const MODEL = process.env.OPENAI_PROSPECTOR_MODEL || "openai/gpt-5.5";
-const AI_GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/responses";
+const WESTERN_STATES = new Set([
+  "Alaska", "Arizona", "California", "Colorado", "Hawaii", "Idaho", "Montana",
+  "Nevada", "New Mexico", "North Dakota", "Oregon", "South Dakota", "Utah",
+  "Washington", "Wyoming",
+]);
 
-function cleanJson(text: string) {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  return fenced ? fenced[1] : text;
+const INDUSTRIES = [
+  "cold storage",
+  "food processing",
+  "meat processing",
+  "poultry processing",
+  "seafood processing",
+  "dairy processing",
+  "cheese manufacturing",
+  "frozen food manufacturing",
+  "produce packing",
+  "beverage manufacturing",
+  "refrigerated distribution",
+  "ice manufacturing",
+];
+
+function cleanText(value: string) {
+  return value.replace(/\s+/g, " ").trim();
 }
 
-async function getGatewayToken() {
-  if (process.env.AI_GATEWAY_API_KEY) return process.env.AI_GATEWAY_API_KEY;
-  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+function decodeSearchUrl(href: string) {
   try {
-    return await getVercelOidcToken();
+    const url = new URL(href, "https://html.duckduckgo.com");
+    const uddg = url.searchParams.get("uddg");
+    return uddg ? decodeURIComponent(uddg) : href;
   } catch {
-    return null;
+    return href;
   }
+}
+
+async function webSearch(query: string) {
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "KeepSupplyProspector/1.0 (+https://keep-supply-prospector.vercel.app)",
+      Accept: "text/html,application/xhtml+xml",
+    },
+    cache: "no-store",
+  });
+  if (!response.ok) return [];
+
+  const html = await response.text();
+  const results: Array<{ title: string; url: string; snippet: string }> = [];
+  const blocks = html.split(/result results_links|result__body/).slice(1);
+
+  for (const block of blocks.slice(0, 12)) {
+    const anchor = block.match(/class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+    if (!anchor) continue;
+    const title = cleanText(anchor[2].replace(/<[^>]+>/g, ""));
+    const url = decodeSearchUrl(anchor[1]);
+    const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a?>/i);
+    const snippet = cleanText((snippetMatch?.[1] || "").replace(/<[^>]+>/g, ""));
+    if (url.startsWith("http") && title) results.push({ title, url, snippet });
+  }
+  return results;
+}
+
+function scoreCandidate(item: { title: string; snippet: string; url: string }) {
+  const text = `${item.title} ${item.snippet}`.toLowerCase();
+  let score = 35;
+  if (/cold storage|refrigerat|freez|warehouse|food processing|meat|poultry|seafood|dairy|cheese|produce|beverage|ice plant/.test(text)) score += 30;
+  if (/ammonia|anhydrous ammonia|nh3/.test(text)) score += 15;
+  if (/rmp|risk management plan|epa|envirofacts|osha|psm/.test(text)) score += 10;
+  if (/distribution|manufactur|processing|packing/.test(text)) score += 5;
+  return Math.min(100, score);
+}
+
+function inferAmmonia(text: string) {
+  const lower = text.toLowerCase();
+  if (!/(ammonia|anhydrous ammonia|nh3)/.test(lower)) return "None indicated";
+  return "Likely";
+}
+
+function inferState(text: string) {
+  for (const state of WESTERN_STATES) {
+    if (text.includes(state)) return state;
+  }
+  const abbreviations: Record<string, string> = {
+    CA: "California", CO: "Colorado", AZ: "Arizona", ID: "Idaho", MT: "Montana",
+    NV: "Nevada", NM: "New Mexico", OR: "Oregon", UT: "Utah", WA: "Washington",
+    WY: "Wyoming", ND: "North Dakota", SD: "South Dakota", AK: "Alaska", HI: "Hawaii",
+  };
+  for (const [abbr, state] of Object.entries(abbreviations)) {
+    if (new RegExp(`\\b${abbr}\\b`).test(text)) return state;
+  }
+  return "Unknown";
+}
+
+async function discoverFree(state: string) {
+  const states = state === "All Western States" ? Array.from(WESTERN_STATES) : [state];
+  const selectedStates = states.slice(0, 6);
+  const queries: string[] = [];
+
+  for (const s of selectedStates) {
+    for (const industry of INDUSTRIES.slice(0, 4)) {
+      queries.push(`"${s}" "${industry}" refrigeration facility`);
+    }
+    queries.push(`"${s}" ammonia refrigeration RMP facility`);
+    queries.push(`site:epa.gov "${s}" ammonia refrigeration facility`);
+  }
+
+  const searchResults = await Promise.all(queries.slice(0, 24).map(webSearch));
+  const seen = new Set<string>();
+  const prospects = [];
+
+  for (const batch of searchResults) {
+    for (const item of batch) {
+      const key = item.url.split("#")[0];
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const text = `${item.title} ${item.snippet}`;
+      const score = scoreCandidate(item);
+      if (score < 45) continue;
+      prospects.push({
+        name: item.title.slice(0, 100),
+        city: "Unknown",
+        state: inferState(text),
+        industry: INDUSTRIES.find((industry) => text.toLowerCase().includes(industry)) || "Industrial refrigeration",
+        refrigeration: /refrigerat|cold storage|freez|ice plant/i.test(text) ? "Likely" : "Unknown",
+        ammonia: inferAmmonia(text),
+        ammoniaLb: null,
+        score,
+        priority: score >= 80 ? "A" : score >= 65 ? "B" : "C",
+        reason: item.snippet || "Public web result indicates a potential industrial refrigeration operation.",
+        sourceUrls: [item.url],
+      });
+      if (prospects.length >= 30) break;
+    }
+    if (prospects.length >= 30) break;
+  }
+
+  prospects.sort((a, b) => b.score - a.score);
+  return prospects.slice(0, 15);
+}
+
+async function researchFree(prospect: unknown) {
+  const text = JSON.stringify(prospect);
+  const queries = [
+    `${text} industrial refrigeration facility`,
+    `${text} ammonia refrigeration`,
+    `${text} EPA RMP OSHA`,
+    `${text} expansion refrigerated warehouse food processing`,
+  ];
+  const batches = await Promise.all(queries.map(webSearch));
+  const flat = batches.flat().slice(0, 20);
+
+  const sources = flat.map((item) => `- ${item.title}: ${item.url}\n  ${item.snippet}`).join("\n");
+  const combined = flat.map((x) => `${x.title} ${x.snippet}`).join(" ");
+  const ammonia = inferAmmonia(combined);
+  const ammoniaEvidence = ammonia === "None indicated"
+    ? "No public ammonia evidence was found in the current free web sweep."
+    : "Public web results contain ammonia-related evidence; treat the charge as unconfirmed until a facility-level source or regulatory record states the quantity.";
+
+  return `Prospect summary\n${text}\n\nIndustrial refrigeration evidence\nPublic web results were found for this facility and related operations.\n\nRefrigeration technology\nBased on the free web sweep: ${/refrigerat|cold storage|freez/i.test(combined) ? "Likely industrial/refrigerated operations" : "Unknown"}.\n\nAmmonia evidence\n${ammonia}. ${ammoniaEvidence}\n\nAmmonia charge and 10,000-lb status\nNot established by the free web sweep. The 10,000-lb test is only applicable if ammonia is actually present.\n\nWhy Keep Supply should care\nThe evidence should be validated against the facility before outreach. Industrial refrigeration is the primary qualification.\n\nRecommended next action\nOpen the strongest source, verify the facility address and refrigeration technology, then prioritize the account based on evidence quality.\n\nSources\n${sources || "No source results returned."}`;
 }
 
 export async function POST(req: Request) {
-  const token = await getGatewayToken();
-  if (!token) {
-    return NextResponse.json(
-      {
-        error:
-          "Live research authentication is unavailable. Enable Secure Backend Access with OIDC Federation for this Vercel project, or add AI_GATEWAY_API_KEY in Production.",
-      },
-      { status: 503 }
-    );
-  }
-
   try {
     const body = await req.json();
     const mode = body?.mode === "discover" ? "discover" : "research";
-    const prospect = body?.prospect;
     const state = body?.state || "All Western States";
 
-    const system = `You are the Keep Supply industrial refrigeration prospecting researcher.
-Your job is to identify and qualify commercial/industrial facilities that are plausible Keep Supply prospects in the Western United States.
-IMPORTANT BUSINESS RULES:
-1. Industrial refrigeration is the primary target. A prospect does NOT need ammonia.
-2. Treat ammonia as a technology signal only.
-3. Only evaluate the 10,000 lb threshold when ammonia is actually present and supported by evidence.
-4. Never invent an ammonia charge. Distinguish confirmed, likely, unknown, and none indicated.
-5. Prefer facility-level evidence over generic corporate information.
-6. Prefer primary/public sources: EPA, OSHA, state environmental agencies, company/facility websites, official PDFs, permits, enforcement records, expansion announcements. Use industry sources as secondary evidence.
-7. Return concise, sales-useful reasoning and include source URLs in the answer.
-8. Do not expose private/personal information. Business contact roles are fine.
-`;
-
-    const prompt = mode === "discover"
-      ? `Find up to 15 new Keep Supply prospects in ${state}. Search across multiple industries that commonly operate industrial refrigeration: cold storage, food processing, meat/poultry/seafood, dairy/cheese, frozen food, produce packing, beverage manufacturing, refrigerated distribution, and similar operations. Cover more than one city/metro where practical.
-
-Return ONLY a JSON array. Each object must have:
-name, city, state, industry, refrigeration, ammonia, ammoniaLb, score, priority, reason, sourceUrls
-where ammonia is one of Confirmed, Likely, Unknown, None indicated; ammoniaLb is a number only when an explicit or well-supported figure is available, otherwise null; score is 0-100; priority is A/B/C. Score the overall industrial refrigeration opportunity first, then add ammonia evidence as a secondary signal.`
-      : `Research this facility for Keep Supply:
-${JSON.stringify(prospect)}
-
-Return a concise research dossier with these headings:
-1. Prospect summary
-2. Industrial refrigeration evidence
-3. Refrigeration technology (confirmed/likely/unknown)
-4. Ammonia evidence (confirmed/likely/unknown/none indicated)
-5. Ammonia charge and 10,000-lb status (only if ammonia is present)
-6. Why Keep Supply should care
-7. Recommended next action
-8. Sources
-
-Be explicit about uncertainty and do not infer an ammonia charge merely because the facility is refrigerated.`;
-
-    const response = await fetch(AI_GATEWAY_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        tools: [{ type: "web_search" }],
-        input: [
-          { role: "system", content: system },
-          { role: "user", content: prompt },
-        ],
-      }),
-    });
-
-    const data = await response.json();
-    if (!response.ok) {
-      return NextResponse.json(
-        { error: data?.error?.message || "The live research provider rejected the request." },
-        { status: response.status }
-      );
-    }
-
-    const text = data?.output_text || "No research result was returned.";
-
     if (mode === "discover") {
-      try {
-        const parsed = JSON.parse(cleanJson(text));
-        return NextResponse.json({ mode, prospects: parsed, raw: text });
-      } catch {
-        return NextResponse.json({ mode, prospects: [], raw: text, parseWarning: true });
-      }
+      const prospects = await discoverFree(state);
+      return NextResponse.json({
+        mode,
+        prospects,
+        provider: "free-web-sweep",
+        note: "Core discovery uses public web results and does not require a paid AI provider.",
+      });
     }
 
-    return NextResponse.json({ mode, dossier: text });
+    const dossier = await researchFree(body?.prospect);
+    return NextResponse.json({ mode, dossier, provider: "free-web-sweep" });
   } catch (error) {
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Unexpected live research error." },
+      { error: error instanceof Error ? error.message : "Unexpected free research error." },
       { status: 500 }
     );
   }
