@@ -1,6 +1,7 @@
+import { getVercelOidcToken } from "@vercel/oidc";
 import { NextResponse } from "next/server";
 
-const MODEL = process.env.OPENAI_PROSPECTOR_MODEL || "openai/gpt-5.4";
+const MODEL = process.env.OPENAI_PROSPECTOR_MODEL || "openai/gpt-5.5";
 const AI_GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/responses";
 
 function cleanJson(text: string) {
@@ -8,16 +9,23 @@ function cleanJson(text: string) {
   return fenced ? fenced[1] : text;
 }
 
-function getGatewayToken() {
-  return process.env.AI_GATEWAY_API_KEY || process.env.VERCEL_OIDC_TOKEN || process.env.OPENAI_API_KEY || null;
+async function getGatewayToken() {
+  if (process.env.AI_GATEWAY_API_KEY) return process.env.AI_GATEWAY_API_KEY;
+  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+  try {
+    return await getVercelOidcToken();
+  } catch {
+    return null;
+  }
 }
 
 export async function POST(req: Request) {
-  const token = getGatewayToken();
+  const token = await getGatewayToken();
   if (!token) {
     return NextResponse.json(
       {
-        error: "Live research backend is not available in this deployment. The app is configured for Vercel AI Gateway and needs its automatic Vercel OIDC credential or an AI Gateway key.",
+        error:
+          "Live research authentication is unavailable. Enable Secure Backend Access with OIDC Federation for this Vercel project, or add AI_GATEWAY_API_KEY in Production.",
       },
       { status: 503 }
     );
@@ -72,13 +80,19 @@ Be explicit about uncertainty and do not infer an ammonia charge merely because 
       body: JSON.stringify({
         model: MODEL,
         tools: [{ type: "web_search" }],
-        input: [{ role: "system", content: system }, { role: "user", content: prompt }],
+        input: [
+          { role: "system", content: system },
+          { role: "user", content: prompt },
+        ],
       }),
     });
 
     const data = await response.json();
     if (!response.ok) {
-      return NextResponse.json({ error: data?.error?.message || "The live research provider rejected the request." }, { status: response.status });
+      return NextResponse.json(
+        { error: data?.error?.message || "The live research provider rejected the request." },
+        { status: response.status }
+      );
     }
 
     const text = data?.output_text || "No research result was returned.";
@@ -94,6 +108,9 @@ Be explicit about uncertainty and do not infer an ammonia charge merely because 
 
     return NextResponse.json({ mode, dossier: text });
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Unexpected live research error." }, { status: 500 });
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Unexpected live research error." },
+      { status: 500 }
+    );
   }
 }
