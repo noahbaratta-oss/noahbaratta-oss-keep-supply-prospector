@@ -123,7 +123,7 @@ function parseDdgLinkFallback(html: string): SearchHit[] {
   for (let i = 0; i < titles.length && hits.length < 10; i += 1) {
     const titleHtml = titles[i][1];
     const start = titles[i].index ?? 0;
-    const before = html.slice(Math.max(0, start - 600), start + 600);
+    const before = html.slice(Math.max(0, start - 700), start + 300);
     const hrefMatch = before.match(/href=["']([^"']+)["']/i);
     const url = hrefMatch ? decodeDdgUrl(hrefMatch[1]) : "";
     const title = stripHtml(titleHtml);
@@ -133,12 +133,32 @@ function parseDdgLinkFallback(html: string): SearchHit[] {
   return hits;
 }
 
+function parseBingResults(html: string): SearchHit[] {
+  const hits: SearchHit[] = [];
+  const blocks = html.split(/<li[^>]+class=["'][^"']*b_algo[^"']*["'][^>]*>/i).slice(1);
+  for (const block of blocks) {
+    if (hits.length >= 10) break;
+    const link = block.match(/<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>\s*<\/h2>/i);
+    if (!link) continue;
+    const snippet = block.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+    const title = stripHtml(link[2]);
+    const url = link[1];
+    if (!title || !/^https?:/i.test(url)) continue;
+    hits.push({ title, url, snippet: snippet ? stripHtml(snippet[1]) : "" });
+  }
+  return hits;
+}
+
+async function fetchSearch(url: string, signal: AbortSignal) {
+  return fetch(url, { headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9" }, cache: "no-store", signal });
+}
+
 async function duckSearch(query: string): Promise<SearchHit[]> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
   try {
     const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const res = await fetch(url, { headers: { "User-Agent": UA }, cache: "no-store", signal: controller.signal });
+    const res = await fetchSearch(url, controller.signal);
     if (!res.ok) return [];
     const html = await res.text();
     const primary = parseDdgResults(html);
@@ -149,6 +169,27 @@ async function duckSearch(query: string): Promise<SearchHit[]> {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function bingSearch(query: string): Promise<SearchHit[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
+  try {
+    const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&setlang=en-US`;
+    const res = await fetchSearch(url, controller.signal);
+    if (!res.ok) return [];
+    return parseBingResults(await res.text());
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function multiSearch(query: string): Promise<SearchHit[]> {
+  const ddg = await duckSearch(query);
+  if (ddg.length) return ddg;
+  return bingSearch(query);
 }
 
 function buildQueries(state: string, batch = 0) {
@@ -198,7 +239,7 @@ export async function POST(req: Request) {
     if (mode === "discover") {
       const batch = Math.max(0, Number(body?.batch) || 0);
       const { queries, totalBatches } = buildQueries(state, batch);
-      const batches = await Promise.all(queries.map(duckSearch));
+      const batches = await Promise.all(queries.map(multiSearch));
       const hits = batches.flat();
       const prospects = dedupeProspects(hits.map((h) => classify(h, state))).filter((p) => p.score >= 45);
       return NextResponse.json({ mode, batch, totalBatches, prospects, hitCount: hits.length, raw: `Batch ${batch + 1} of ${totalBatches}: ${hits.length} public search results, ${prospects.length} candidates.` });
@@ -214,7 +255,7 @@ export async function POST(req: Request) {
       `"${name}" site:epa.gov ammonia`,
       `"${name}" site:osha.gov refrigeration ammonia`,
     ];
-    const batches = await Promise.all(searchTerms.map(duckSearch));
+    const batches = await Promise.all(searchTerms.map(multiSearch));
     const hits = Array.from(new Map(batches.flat().map((h) => [h.url, h])).values()).slice(0, 20);
     return NextResponse.json({ mode, dossier: formatResearch(name, hits), sources: hits.map((h) => h.url) });
   } catch (error) {
