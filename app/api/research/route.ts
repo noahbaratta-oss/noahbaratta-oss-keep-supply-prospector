@@ -8,7 +8,6 @@ const EPA_TIMEOUT_MS = 3500;
 
 type SearchHit = { title: string; url: string; snippet: string };
 type Prospect = { name: string; city: string; state: string; industry: string; refrigeration: string; ammonia: "Confirmed" | "Likely" | "Unknown" | "None indicated"; ammoniaLb: number | null; score: number; priority: "A" | "B" | "C"; reason: string; sourceUrls: string[] };
-
 type FetchedFacility = { name?: string; city?: string; state?: string; registryId?: string; program?: string; address?: string };
 
 function stripHtml(input: string) {
@@ -51,7 +50,6 @@ function classifyFacility(f: FetchedFacility): Prospect {
   const industryTerms = ["cold", "food", "meat", "poultry", "seafood", "dairy", "cheese", "ice", "produce", "fruit", "brew", "beverage", "warehouse", "distribution", "frozen", "processing", "packing"];
   const industryHits = industryTerms.filter((t) => text.includes(t)).length;
   const rmp = /\brmp\b|risk management plan/.test(text);
-  const ammonia = rmp || /ammonia|anhydrous/.test(text) ? "Likely" : "Unknown";
   let score = 48 + Math.min(22, industryHits * 4) + (rmp ? 22 : 0);
   if (/tri|rcra|echo/.test(text)) score += 3;
   score = Math.min(100, score);
@@ -112,9 +110,9 @@ async function fetchEpaState(stateCode: string): Promise<Prospect[]> {
     const url = `https://data.epa.gov/efservice/frs.frs_program_facility/state_code/equals/${stateCode}/0:100/json`;
     const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" }, cache: "no-store", signal: controller.signal });
     if (!res.ok) return [];
-    const data = await res.json();
-    const rows = Array.isArray(data) ? data : Array.isArray(data?.results) ? data.results : [];
-    return rows.slice(0, 100).map((r: any) => classifyFacility({ name: r.facility_name || r.facility_name_txt || r.name, city: r.city_name || r.city, state: r.state_code || stateCode, registryId: r.registry_id || r.registry_id_num, program: r.pgm_sys_acrnm || r.program_system_acronym, address: r.location_address || r.address })).filter((p) => p.score >= 55);
+    const data: unknown = await res.json();
+    const rows: any[] = Array.isArray(data) ? data : typeof data === "object" && data !== null && Array.isArray((data as { results?: unknown }).results) ? (data as { results: any[] }).results : [];
+    return rows.slice(0, 100).map((r: any) => classifyFacility({ name: r.facility_name || r.facility_name_txt || r.name, city: r.city_name || r.city, state: r.state_code || stateCode, registryId: r.registry_id || r.registry_id_num, program: r.pgm_sys_acrnm || r.program_system_acronym, address: r.location_address || r.address })).filter((p: Prospect) => p.score >= 55);
   } catch { return []; } finally { clearTimeout(timeout); }
 }
 function buildQueries(state: string, batch = 0) {
@@ -125,8 +123,19 @@ function buildQueries(state: string, batch = 0) {
   const size = 4;
   return { queries: all.slice(batch * size, (batch + 1) * size), totalBatches: Math.ceil(all.length / size) };
 }
-function dedupeProspects(items: Prospect[]) { const map = new Map<string, Prospect>(); for (const item of items) { const key = `${item.name.toLowerCase()}|${item.city.toLowerCase()}|${item.state.toLowerCase()}`; const old = map.get(key); if (!old || item.score > old.score) map.set(key, item); } return [...map.values()].sort((a, b) => b.score - a.score); }
-function formatResearch(name: string, hits: SearchHit[]) { if (!hits.length) return `No public-search results were retrieved for ${name}. Try a broader facility name, city, or industry keyword.`; return [`LIVE PUBLIC WEB RESEARCH: ${name}`, "", ...hits.slice(0, 12).map((h, i) => `${i + 1}. ${h.title}\n   ${h.snippet}\n   Source: ${h.url}`), "", "Qualification note: industrial refrigeration is the primary target. Ammonia is optional; the 10,000-lb test applies only when ammonia evidence is present."].join("\n"); }
+function dedupeProspects(items: Prospect[]) {
+  const map = new Map<string, Prospect>();
+  for (const item of items) {
+    const key = `${item.name.toLowerCase()}|${item.city.toLowerCase()}|${item.state.toLowerCase()}`;
+    const old = map.get(key);
+    if (!old || item.score > old.score) map.set(key, item);
+  }
+  return [...map.values()].sort((a, b) => b.score - a.score);
+}
+function formatResearch(name: string, hits: SearchHit[]) {
+  if (!hits.length) return `No public-search results were retrieved for ${name}. Try a broader facility name, city, or industry keyword.`;
+  return [`LIVE PUBLIC WEB RESEARCH: ${name}`, "", ...hits.slice(0, 12).map((h, i) => `${i + 1}. ${h.title}\n   ${h.snippet}\n   Source: ${h.url}`), "", "Qualification note: industrial refrigeration is the primary target. Ammonia is optional; the 10,000-lb test applies only when ammonia evidence is present."].join("\n");
+}
 
 export async function POST(req: Request) {
   try {
@@ -136,20 +145,25 @@ export async function POST(req: Request) {
     if (mode === "discover") {
       const batch = Math.max(0, Number(body?.batch) || 0);
       const { queries, totalBatches } = buildQueries(state, batch);
-      const searchResults = await Promise.all(queries.map(multiSearch));
-      const webHits = searchResults.flat();
-      const epaStates = state === "All Western States" ? WESTERN_STATES.slice(batch, batch + 2) : [state];
-      const epaProspects = (await Promise.all(epaStates.map((s) => fetchEpaState(STATE_CODES[s])))).flat();
-      const webProspects = webHits.map((h) => classify(h, state));
+      const stateScope = state === "All Western States" ? WESTERN_STATES : [state];
+      const [webBatches, epaBatches] = await Promise.all([
+        Promise.all(queries.map(multiSearch)),
+        Promise.all(stateScope.slice(0, 2).map((s) => fetchEpaState(STATE_CODES[s])))
+      ]);
+      const hits = webBatches.flat();
+      const webProspects = hits.map((h) => classify(h, state));
+      const epaProspects = epaBatches.flat();
       const prospects = dedupeProspects([...webProspects, ...epaProspects]).filter((p) => p.score >= 45);
-      return NextResponse.json({ mode, batch, totalBatches, prospects, hitCount: webHits.length, epaCount: epaProspects.length, raw: `Batch ${batch + 1} of ${totalBatches}: ${webHits.length} web hits + ${epaProspects.length} EPA facility candidates.` });
+      return NextResponse.json({ mode, batch, totalBatches, prospects, hitCount: hits.length, epaCount: epaProspects.length, raw: `Batch ${batch + 1} of ${totalBatches}: ${hits.length} web results + ${epaProspects.length} EPA facility candidates → ${prospects.length} total candidates.` });
     }
     const prospect = body?.prospect || {};
     const name = prospect.name || "industrial refrigeration facility";
     const city = prospect.city || "";
-    const terms = [`"${name}" ${city} industrial refrigeration`, `"${name}" ammonia refrigeration`, `"${name}" cold storage refrigerated`, `"${name}" site:epa.gov ammonia`, `"${name}" site:osha.gov refrigeration ammonia`];
-    const batches = await Promise.all(terms.map(multiSearch));
+    const searchTerms = [`"${name}" ${city} industrial refrigeration`, `"${name}" ammonia refrigeration`, `"${name}" cold storage refrigerated`, `"${name}" site:epa.gov ammonia`, `"${name}" site:osha.gov refrigeration ammonia`];
+    const batches = await Promise.all(searchTerms.map(multiSearch));
     const hits = Array.from(new Map(batches.flat().map((h) => [h.url, h])).values()).slice(0, 20);
     return NextResponse.json({ mode, dossier: formatResearch(name, hits), sources: hits.map((h) => h.url) });
-  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : "Unexpected public-web research error." }, { status: 500 }); }
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unexpected public-web research error." }, { status: 500 });
+  }
 }
