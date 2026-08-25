@@ -16,3 +16,7 @@ Public web search, company/facility websites, EPA RMP and Envirofacts data, OSHA
 ## Deployment
 
 Hosted web application on Vercel. End users should only need a browser.
+
+## Live research
+
+The hosted research route expects the `OPENAI_API_KEY` environment variable in Vercel. Environment variables are server-side and are never exposed to the browser.
