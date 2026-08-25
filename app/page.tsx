@@ -5,12 +5,26 @@ import { useEffect, useMemo, useState } from "react";
 const STATES = ["All Western States", "Arizona", "California", "Colorado", "Idaho", "Montana", "Nevada", "New Mexico", "Oregon", "Utah", "Washington", "Wyoming", "Alaska", "Hawaii"];
 const MEMORY_KEY = "keep-supply-prospect-memory-v1";
 const SWEEP_KEY = "keep-supply-prospect-sweep-v1";
+const LIFETIME_KEY = "keep-supply-prospect-lifetime-v2";
+const LAST_SEARCH_KEY = "keep-supply-prospect-last-search-v2";
+const SAVED_KEY = "keep-supply-prospect-saved-v2";
 
 type Prospect = {
-  name: string; city: string; state: string; industry: string; refrigeration: string;
+  name: string;
+  city: string;
+  state: string;
+  industry: string;
+  refrigeration: string;
   ammonia: "Confirmed" | "Likely" | "Unknown" | "None indicated";
-  ammoniaLb?: number | null; score: number; priority: "A" | "B" | "C";
-  reason: string; sourceUrls?: string[]; isNew?: boolean;
+  ammoniaLb?: number | null;
+  score: number;
+  priority: "A" | "B" | "C";
+  reason: string;
+  sourceUrls?: string[];
+  isNew?: boolean;
+  saved?: boolean;
+  firstSeen?: number;
+  lastSeen?: number;
 };
 
 const seedProspects: Prospect[] = [
@@ -28,13 +42,25 @@ function keyFor(p: Pick<Prospect, "name" | "city" | "state">) {
   return `${p.name}|${p.city}|${p.state}`.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+function readJson<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) as T : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export default function Home() {
+  const [view, setView] = useState<"search" | "lifetime" | "new" | "saved">("search");
   const [state, setState] = useState(STATES[0]);
   const [query, setQuery] = useState("");
   const [ammoniaOnly, setAmmoniaOnly] = useState(false);
-  const [newOnly, setNewOnly] = useState(false);
   const [minScore, setMinScore] = useState(45);
   const [prospects, setProspects] = useState<Prospect[]>(seedProspects);
+  const [lifetime, setLifetime] = useState<Record<string, Prospect>>({});
+  const [lastSearch, setLastSearch] = useState<Prospect[]>([]);
+  const [saved, setSaved] = useState<Record<string, Prospect>>({});
   const [memory, setMemory] = useState<Record<string, number>>({});
   const [sweep, setSweep] = useState(0);
   const [selected, setSelected] = useState<Prospect | null>(null);
@@ -45,32 +71,74 @@ export default function Home() {
   const [researchText, setResearchText] = useState("");
 
   useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(MEMORY_KEY) || "{}") as Record<string, number>;
-      const nextSweep = Number(localStorage.getItem(SWEEP_KEY) || "0");
-      setMemory(saved); setSweep(Number.isFinite(nextSweep) ? nextSweep : 0);
-      setProspects(seedProspects.map((p) => ({ ...p, isNew: !saved[keyFor(p)] })));
-    } catch { /* browser storage may be unavailable */ }
+    const savedMemory = readJson<Record<string, number>>(MEMORY_KEY, {});
+    const savedLifetime = readJson<Record<string, Prospect>>(LIFETIME_KEY, {});
+    const savedLast = readJson<Prospect[]>(LAST_SEARCH_KEY, []);
+    const savedSaved = readJson<Record<string, Prospect>>(SAVED_KEY, {});
+    const nextSweep = Number(localStorage.getItem(SWEEP_KEY) || "0");
+
+    const base = Object.keys(savedLifetime).length ? Object.values(savedLifetime) : seedProspects;
+    const withSaved = base.map((p) => ({ ...p, saved: Boolean(savedSaved[keyFor(p)]), isNew: savedLast.some((x) => keyFor(x) === keyFor(p)) }));
+    const nextLifetime: Record<string, Prospect> = { ...savedLifetime };
+    for (const p of seedProspects) if (!nextLifetime[keyFor(p)]) nextLifetime[keyFor(p)] = p;
+
+    setMemory(savedMemory);
+    setLifetime(nextLifetime);
+    setProspects(withSaved.length ? withSaved : seedProspects);
+    setLastSearch(savedLast);
+    setSaved(savedSaved);
+    setSweep(Number.isFinite(nextSweep) ? nextSweep : 0);
   }, []);
 
-  const filtered = useMemo(() => prospects
+  const activePool = useMemo(() => {
+    if (view === "lifetime") return Object.values(lifetime);
+    if (view === "new") return lastSearch;
+    if (view === "saved") return Object.values(saved);
+    return prospects;
+  }, [view, lifetime, lastSearch, saved, prospects]);
+
+  const filtered = useMemo(() => activePool
     .filter((p) => state === STATES[0] || p.state === state)
     .filter((p) => !query || `${p.name} ${p.city} ${p.state} ${p.industry} ${p.refrigeration}`.toLowerCase().includes(query.toLowerCase()))
     .filter((p) => p.score >= minScore)
     .filter((p) => !ammoniaOnly || p.ammonia !== "None indicated")
-    .filter((p) => !newOnly || p.isNew)
-    .sort((a, b) => b.score - a.score), [state, query, minScore, ammoniaOnly, newOnly, prospects]);
+    .sort((a, b) => b.score - a.score), [activePool, state, query, minScore, ammoniaOnly]);
 
-  const newCount = prospects.filter((p) => p.isNew).length;
-  const territoryMemoryCount = Object.keys(memory).length;
+  const newCount = lastSearch.length;
+  const territoryMemoryCount = Object.keys(lifetime).length;
+  const savedCount = Object.keys(saved).length;
   const ammonia10k = filtered.filter((p) => p.ammonia === "Confirmed" && (p.ammoniaLb == null || p.ammoniaLb >= 10000)).length;
 
-  function saveMemory(items: Prospect[]) {
+  function persistLifetime(items: Prospect[]) {
+    const next = { ...lifetime };
+    const now = Date.now();
+    for (const raw of items) {
+      const k = keyFor(raw);
+      const prior = next[k];
+      next[k] = { ...prior, ...raw, firstSeen: prior?.firstSeen ?? now, lastSeen: now, saved: Boolean(saved[k]), isNew: true };
+    }
+    setLifetime(next);
+    try { localStorage.setItem(LIFETIME_KEY, JSON.stringify(next)); } catch { /* storage unavailable */ }
+    return next;
+  }
+
+  function persistMemory(items: Prospect[]) {
     const next = { ...memory };
     for (const p of items) next[keyFor(p)] = next[keyFor(p)] ?? Date.now();
     setMemory(next);
-    try { localStorage.setItem(MEMORY_KEY, JSON.stringify(next)); } catch { /* ignore */ }
-    return next;
+    try { localStorage.setItem(MEMORY_KEY, JSON.stringify(next)); } catch { /* storage unavailable */ }
+  }
+
+  function toggleSaved(p: Prospect) {
+    const k = keyFor(p);
+    const next = { ...saved };
+    if (next[k]) delete next[k];
+    else next[k] = { ...p, saved: true };
+    setSaved(next);
+    setLifetime((current) => ({ ...current, [k]: { ...current[k], ...p, saved: Boolean(next[k]) } }));
+    setProspects((current) => current.map((x) => keyFor(x) === k ? { ...x, saved: Boolean(next[k]) } : x));
+    try { localStorage.setItem(SAVED_KEY, JSON.stringify(next)); } catch { /* storage unavailable */ }
+    return Boolean(next[k]);
   }
 
   async function researchProspect(p: Prospect) {
@@ -80,29 +148,34 @@ export default function Home() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Research failed");
       setResearchText(data.dossier || "No dossier returned.");
-      saveMemory([p]);
-      setProspects((current) => current.map((x) => keyFor(x) === keyFor(p) ? { ...x, isNew: false } : x));
+      persistMemory([p]);
     } catch (e) { setError(e instanceof Error ? e.message : "Research failed"); }
     finally { setResearching(false); }
   }
 
   async function discoverTerritory() {
-    setError(""); setDiscovering(true); setSelected(null); setResearchText("");
+    setError(""); setDiscovering(true); setSelected(null); setResearchText(""); setView("search");
     const priorMemory = { ...memory };
     const currentSweep = sweep;
     const total = state === STATES[0] ? 18 : 8;
-    setProgress(`Starting search cycle ${currentSweep + 1}…`);
+    setProgress(`Deep searching ${state === STATES[0] ? "the entire Western territory" : state}…`);
+
     try {
       const allIncoming: Prospect[] = [];
-      for (let batch = 0; batch < total; batch++) {
-        const res = await fetch("/api/research", {
-          method: "POST", headers: { "Content-Type": "application/json" },
+      const concurrency = 3;
+      for (let start = 0; start < total; start += concurrency) {
+        const batchNumbers = Array.from({ length: Math.min(concurrency, total - start) }, (_, i) => start + i);
+        const responses = await Promise.all(batchNumbers.map((batch) => fetch("/api/research", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ mode: "discover", state, batch, sweep: currentSweep, knownKeys: Object.keys(priorMemory) })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || `Discovery failed on batch ${batch + 1}`);
-        if (Array.isArray(data.prospects)) allIncoming.push(...data.prospects);
-        setProgress(`Search cycle ${currentSweep + 1}: batch ${batch + 1}/${total} — ${allIncoming.length} new candidates found.`);
+        })));
+        const payloads = await Promise.all(responses.map(async (res) => ({ ok: res.ok, data: await res.json() })));
+        for (const payload of payloads) {
+          if (!payload.ok) throw new Error(payload.data.error || "Discovery request failed");
+          if (Array.isArray(payload.data.prospects)) allIncoming.push(...payload.data.prospects);
+        }
+        setProgress(`Deep searching… ${allIncoming.length} candidates collected so far.`);
       }
 
       const deduped = new Map<string, Prospect>();
@@ -111,7 +184,12 @@ export default function Home() {
         const existing = deduped.get(k);
         if (!existing || p.score > existing.score) deduped.set(k, p);
       }
-      const incoming = [...deduped.values()].map((p) => ({ ...p, isNew: !priorMemory[keyFor(p)] }));
+      const incoming = [...deduped.values()].map((p) => ({ ...p, isNew: !priorMemory[keyFor(p)], saved: Boolean(saved[keyFor(p)]) }));
+      persistLifetime(incoming);
+      persistMemory(incoming);
+      setLastSearch(incoming);
+      try { localStorage.setItem(LAST_SEARCH_KEY, JSON.stringify(incoming)); } catch { /* storage unavailable */ }
+
       setProspects((current) => {
         const map = new Map<string, Prospect>();
         for (const p of current) map.set(keyFor(p), p);
@@ -119,12 +197,11 @@ export default function Home() {
         return [...map.values()].sort((a, b) => b.score - a.score);
       });
 
-      const nextMemory = saveMemory(incoming);
-      setMemory(nextMemory);
       const nextSweep = currentSweep + 1;
       setSweep(nextSweep);
-      try { localStorage.setItem(SWEEP_KEY, String(nextSweep)); } catch { /* ignore */ }
-      setProgress(`Cycle ${currentSweep + 1} complete — ${incoming.length} genuinely NEW prospects added. Next cycle will use a different search strategy.`);
+      try { localStorage.setItem(SWEEP_KEY, String(nextSweep)); } catch { /* storage unavailable */ }
+      setProgress(`Deep search complete — ${incoming.filter((p) => p.isNew).length} NEW prospects returned, ${incoming.length} total unique results.`);
+      setView("new");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Discovery failed");
       setProgress("");
@@ -133,23 +210,70 @@ export default function Home() {
 
   return (
     <main className="page">
-      <header className="header"><div><div className="eyebrow">KEEP SUPPLY</div><h1>Prospecting Engine</h1><p>Industrial refrigeration first. Ammonia is a qualifier—not a requirement.</p></div><div className="pill">WESTERN U.S.</div></header>
+      <header className="header">
+        <div><div className="eyebrow">KEEP SUPPLY</div><h1>Prospecting Engine</h1><p>Industrial refrigeration first. Ammonia is a qualifier—not a requirement.</p></div>
+        <div className="pill">WESTERN U.S.</div>
+      </header>
+
+      <nav className="tabs">
+        <button className={view === "search" ? "tab active" : "tab"} onClick={() => setView("search")}>Deep Search</button>
+        <button className={view === "lifetime" ? "tab active" : "tab"} onClick={() => setView("lifetime")}>Lifetime <span>{territoryMemoryCount}</span></button>
+        <button className={view === "new" ? "tab active" : "tab"} onClick={() => setView("new")}>New From Last Search <span>{newCount}</span></button>
+        <button className={view === "saved" ? "tab active" : "tab"} onClick={() => setView("saved")}>Saved <span>{savedCount}</span></button>
+      </nav>
+
       <section className="controls">
         <div className="control wide"><label>Search facilities</label><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="cold storage, food processing, company, city…" /></div>
         <div className="control"><label>Territory</label><select value={state} onChange={(e) => setState(e.target.value)}>{STATES.map((s) => <option key={s}>{s}</option>)}</select></div>
         <div className="control"><label>Minimum score</label><input type="range" min="0" max="100" value={minScore} onChange={(e) => setMinScore(Number(e.target.value))}/><span className="rangeValue">{minScore}</span></div>
         <label className="check"><input type="checkbox" checked={ammoniaOnly} onChange={(e) => setAmmoniaOnly(e.target.checked)} /> Ammonia only</label>
-        <label className="check"><input type="checkbox" checked={newOnly} onChange={(e) => setNewOnly(e.target.checked)} /> New only</label>
       </section>
-      <section className="actions"><button className="primary" onClick={discoverTerritory} disabled={discovering}>{discovering ? "Scanning…" : `Find new prospects ${state === STATES[0] ? "across the West" : `in ${state}`}`}</button><span>{progress || `Search cycle ${sweep + 1}. Each cycle rotates the discovery strategy so the engine keeps looking for different customers.`}</span></section>
+
+      <section className="actions">
+        <button className="primary" onClick={discoverTerritory} disabled={discovering}>{discovering ? "Deep searching…" : `Deep Search ${state === STATES[0] ? "the West" : state}`}</button>
+        <span>{progress || `Search cycle ${sweep + 1}. One click runs the full discovery sweep; internal requests are parallelized to stay within free hosting limits.`}</span>
+      </section>
+
       {error && <div className="errorBox">{error}</div>}
-      <section className="stats"><div className="stat"><span>Prospects shown</span><strong>{filtered.length}</strong></div><div className="stat"><span>NEW prospects</span><strong>{newCount}</strong></div><div className="stat"><span>Territory memory</span><strong>{territoryMemoryCount}</strong></div><div className="stat"><span>Ammonia 10k+ signal</span><strong>{ammonia10k}</strong></div></section>
+
+      <section className="stats">
+        <div className="stat"><span>Showing</span><strong>{filtered.length}</strong></div>
+        <div className="stat"><span>New last search</span><strong>{newCount}</strong></div>
+        <div className="stat"><span>Lifetime prospects</span><strong>{territoryMemoryCount}</strong></div>
+        <div className="stat"><span>Saved</span><strong>{savedCount}</strong></div>
+      </section>
+
       <section className="note"><strong>Qualification:</strong> any industrial refrigeration can be a Keep Supply prospect. The 10,000-lb threshold applies only when ammonia is present.</section>
-      <section className="tableWrap"><table><thead><tr><th>Score</th><th>Prospect</th><th>Location</th><th>Industry</th><th>Refrigeration</th><th>Ammonia</th><th>Priority</th><th></th></tr></thead><tbody>
-        {filtered.map((p) => <tr key={keyFor(p)} onClick={() => setSelected(p)}><td><span className={`score s${p.score >= 90 ? "high" : p.score >= 80 ? "mid" : "low"}`}>{p.score}</span></td><td><strong>{p.name}</strong>{p.isNew ? <small> • NEW</small> : ""}</td><td>{p.city}, {p.state}</td><td>{p.industry}</td><td>{p.refrigeration}</td><td>{p.ammonia === "None indicated" ? "—" : p.ammonia}{p.ammoniaLb != null && p.ammoniaLb >= 10000 ? <small> • ≥10k</small> : ""}</td><td><span className={`priority p${p.priority}`}>{p.priority}</span></td><td><button className="mini" onClick={(e) => { e.stopPropagation(); researchProspect(p); }}>Research</button></td></tr>)}
-        {!filtered.length && <tr><td colSpan={8} className="empty">No prospects match the current filters. Run another search cycle or lower the score filter.</td></tr>}
-      </tbody></table></section>
-      {selected && <div className="overlay" onClick={() => setSelected(null)}><aside className="drawer" onClick={(e) => e.stopPropagation()}><button className="close" onClick={() => setSelected(null)}>×</button><div className="eyebrow">PROSPECT DOSSIER</div><h2>{selected.name}</h2><p className="muted">{selected.city}, {selected.state} · {selected.industry}</p><div className="dossierGrid"><div><span>Score</span><strong>{selected.score}/100</strong></div><div><span>Priority</span><strong>{selected.priority}</strong></div><div><span>Refrigeration</span><strong>{selected.refrigeration}</strong></div><div><span>Ammonia</span><strong>{selected.ammonia}</strong></div></div><div className="researchHeader"><h3>Live web research</h3><button className="mini" onClick={() => researchProspect(selected)} disabled={researching}>{researching ? "Researching…" : "Research now"}</button></div>{researchText ? <pre className="researchText">{researchText}</pre> : <p className="muted">Run live research to collect current public evidence and source links.</p>}</aside></div>}
+
+      <section className="tableWrap">
+        <table>
+          <thead><tr><th>Score</th><th>Prospect</th><th>Location</th><th>Industry</th><th>Refrigeration</th><th>Ammonia</th><th>Priority</th><th>Save</th><th></th></tr></thead>
+          <tbody>
+            {filtered.map((p) => <tr key={keyFor(p)} onClick={() => setSelected(p)}>
+              <td><span className={`score s${p.score >= 90 ? "high" : p.score >= 80 ? "mid" : "low"}`}>{p.score}</span></td>
+              <td><strong>{p.name}</strong>{p.isNew ? <small> • NEW</small> : ""}</td>
+              <td>{p.city}, {p.state}</td><td>{p.industry}</td><td>{p.refrigeration}</td>
+              <td>{p.ammonia === "None indicated" ? "—" : p.ammonia}{p.ammoniaLb != null && p.ammoniaLb >= 10000 ? <small> • ≥10k</small> : ""}</td>
+              <td><span className={`priority p${p.priority}`}>{p.priority}</span></td>
+              <td><button className="saveBtn" aria-label={p.saved ? "Remove from saved" : "Save prospect"} onClick={(e) => { e.stopPropagation(); toggleSaved(p); }}>{p.saved ? "★" : "☆"}</button></td>
+              <td><button className="mini" onClick={(e) => { e.stopPropagation(); researchProspect(p); }}>Research</button></td>
+            </tr>)}
+            {!filtered.length && <tr><td colSpan={9} className="empty">Nothing here yet. Run a Deep Search or change the filters.</td></tr>}
+          </tbody>
+        </table>
+      </section>
+
+      {selected && <div className="overlay" onClick={() => setSelected(null)}>
+        <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+          <button className="close" onClick={() => setSelected(null)}>×</button>
+          <div className="eyebrow">PROSPECT DOSSIER</div>
+          <div className="drawerTitleRow"><div><h2>{selected.name}</h2><p className="muted">{selected.city}, {selected.state} · {selected.industry}</p></div><button className="saveLarge" onClick={() => { const next = toggleSaved(selected); setSelected({ ...selected, saved: next }); }}>{selected.saved ? "★ Saved" : "☆ Save"}</button></div>
+          <div className="dossierGrid"><div><span>Score</span><strong>{selected.score}/100</strong></div><div><span>Priority</span><strong>{selected.priority}</strong></div><div><span>Refrigeration</span><strong>{selected.refrigeration}</strong></div><div><span>Ammonia</span><strong>{selected.ammonia}</strong></div></div>
+          <p className="reason">{selected.reason}</p>
+          <div className="researchHeader"><h3>Live web research</h3><button className="mini" onClick={() => researchProspect(selected)} disabled={researching}>{researching ? "Researching…" : "Research now"}</button></div>
+          {researchText ? <pre className="researchText">{researchText}</pre> : <p className="muted">Run live research to collect current public evidence and source links.</p>}
+        </aside>
+      </div>}
     </main>
   );
 }
