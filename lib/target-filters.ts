@@ -110,3 +110,21 @@ export const INDUSTRY_SEARCH_ALIASES: Record<string, string[]> = {
   "Industrial mechanical contractors": ["industrial mechanical contractor", "mechanical contractor refrigeration"],
   "Refrigeration equipment installers": ["refrigeration equipment installer", "industrial refrigeration installer"]
 };
+
+const PUBLIC_SOURCE_EXPANSION = [
+  "site:epa.gov", "site:osha.gov", "site:usda.gov", "site:fsis.usda.gov", "site:fda.gov", "site:energy.gov",
+  "site:.gov", "site:.state.us", "site:edu", "site:org", "site:com",
+  "permit", "environmental permit", "facility permit", "inspection", "risk management plan", "RMP", "PSM",
+  "facility directory", "plant directory", "member directory", "company directory", "facility list", "plant list",
+  "site:filetype:pdf", "filetype:pdf", "engineering report", "expansion", "new plant", "distribution center",
+  "cold chain", "industrial park", "economic development", "planning commission", "zoning", "procurement", "bid"
+];
+
+for (const target of Object.keys(INDUSTRY_SEARCH_ALIASES)) {
+  INDUSTRY_SEARCH_ALIASES[target] = [
+    ...new Set([
+      ...INDUSTRY_SEARCH_ALIASES[target],
+      ...PUBLIC_SOURCE_EXPANSION.map((source) => `${INDUSTRY_SEARCH_ALIASES[target][0]} ${source}`)
+    ])
+  ];
+}
