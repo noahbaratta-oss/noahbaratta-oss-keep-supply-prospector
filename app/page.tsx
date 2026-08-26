@@ -8,6 +8,7 @@ const SWEEP_KEY = "keep-supply-prospect-sweep-v1";
 const LIFETIME_KEY = "keep-supply-prospect-lifetime-v2";
 const LAST_SEARCH_KEY = "keep-supply-prospect-last-search-v2";
 const SAVED_KEY = "keep-supply-prospect-saved-v2";
+const FILTER_KEY = "keep-supply-target-filters-v1";
 
 type Prospect = {
   name: string; city: string; state: string; industry: string; refrigeration: string;
@@ -48,18 +49,20 @@ export default function Home() {
   const [progress, setProgress] = useState("");
   const [error, setError] = useState("");
   const [researchText, setResearchText] = useState("");
+  const [filterCount, setFilterCount] = useState(0);
 
   useEffect(() => {
     const savedMemory = readJson<Record<string, number>>(MEMORY_KEY, {});
     const savedLifetime = readJson<Record<string, Prospect>>(LIFETIME_KEY, {});
     const savedLast = readJson<Prospect[]>(LAST_SEARCH_KEY, []);
     const savedSaved = readJson<Record<string, Prospect>>(SAVED_KEY, {});
+    const selectedFilters = readJson<string[]>(FILTER_KEY, []);
     const nextSweep = Number(localStorage.getItem(SWEEP_KEY) || "0");
     const base = Object.keys(savedLifetime).length ? Object.values(savedLifetime) : seedProspects;
     const nextLifetime: Record<string, Prospect> = { ...savedLifetime };
     for (const p of seedProspects) if (!nextLifetime[keyFor(p)]) nextLifetime[keyFor(p)] = p;
     setMemory(savedMemory); setLifetime(nextLifetime); setProspects(base.map((p) => ({ ...p, saved: Boolean(savedSaved[keyFor(p)]), isNew: savedLast.some((x) => keyFor(x) === keyFor(p)) })));
-    setLastSearch(savedLast); setSaved(savedSaved); setSweep(Number.isFinite(nextSweep) ? nextSweep : 0);
+    setLastSearch(savedLast); setSaved(savedSaved); setSweep(Number.isFinite(nextSweep) ? nextSweep : 0); setFilterCount(selectedFilters.length);
   }, []);
 
   const activePool = useMemo(() => view === "lifetime" ? Object.values(lifetime) : view === "new" ? lastSearch : view === "saved" ? Object.values(saved) : prospects, [view, lifetime, lastSearch, saved, prospects]);
@@ -90,19 +93,20 @@ export default function Home() {
 
   async function discoverTerritory() {
     setError(""); setDiscovering(true); setSelected(null); setResearchText(""); setView("search");
-    const priorMemory = { ...memory }; const currentSweep = sweep; setProgress(`Deep searching ${state === STATES[0] ? "the entire Western territory" : state}…`);
+    const priorMemory = { ...memory }; const currentSweep = sweep; const selectedCategories = readJson<string[]>(FILTER_KEY, []); setFilterCount(selectedCategories.length);
+    setProgress(`Deep searching ${state === STATES[0] ? "the entire Western territory" : state}${selectedCategories.length ? ` across ${selectedCategories.length} target types` : ""}…`);
     try {
       const allIncoming: Prospect[] = [];
-      const firstRes = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "discover", state, batch: 0, sweep: currentSweep, knownKeys: Object.keys(priorMemory) }) });
+      const firstRes = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "discover", state, batch: 0, sweep: currentSweep, knownKeys: Object.keys(priorMemory), selectedCategories }) });
       const firstData = await firstRes.json(); if (!firstRes.ok) throw new Error(firstData.error || "Discovery request failed");
-      const total = Math.max(1, Number(firstData.totalBatches) || (state === STATES[0] ? 10 : 4));
+      const total = Math.max(1, Number(firstData.totalBatches) || (state === STATES[0] ? 12 : 5));
       if (Array.isArray(firstData.prospects)) allIncoming.push(...firstData.prospects);
       setProgress(`Research pack 1/${total} complete — ${allIncoming.length} candidates collected.`);
 
       const concurrency = 3;
       for (let start = 1; start < total; start += concurrency) {
         const numbers = Array.from({ length: Math.min(concurrency, total - start) }, (_, i) => start + i);
-        const responses = await Promise.all(numbers.map((batch) => fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "discover", state, batch, sweep: currentSweep, knownKeys: Object.keys(priorMemory) }) })));
+        const responses = await Promise.all(numbers.map((batch) => fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "discover", state, batch, sweep: currentSweep, knownKeys: Object.keys(priorMemory), selectedCategories }) })));
         const payloads = await Promise.all(responses.map(async (res) => ({ ok: res.ok, data: await res.json() })));
         for (const payload of payloads) { if (!payload.ok) throw new Error(payload.data.error || "Discovery request failed"); if (Array.isArray(payload.data.prospects)) allIncoming.push(...payload.data.prospects); }
         setProgress(`Deep searching… ${Math.min(start + concurrency, total)}/${total} research packs complete — ${allIncoming.length} candidates collected.`);
@@ -121,7 +125,7 @@ export default function Home() {
     <main className="page">
       <header className="header"><div><div className="eyebrow">KEEP SUPPLY</div><h1>Prospecting Engine</h1><p>Industrial refrigeration first. Ammonia is a qualifier—not a requirement.</p></div><div className="pill">WESTERN U.S.</div></header>
       <nav className="tabs"><button className={view === "search" ? "tab active" : "tab"} onClick={() => setView("search")}>Deep Search</button><button className={view === "lifetime" ? "tab active" : "tab"} onClick={() => setView("lifetime")}>Lifetime <span>{territoryMemoryCount}</span></button><button className={view === "new" ? "tab active" : "tab"} onClick={() => setView("new")}>New From Last Search <span>{newCount}</span></button><button className={view === "saved" ? "tab active" : "tab"} onClick={() => setView("saved")}>Saved <span>{savedCount}</span></button></nav>
-      <section className="controls"><div className="control wide"><label>Search facilities</label><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="cold storage, food processing, company, city…" /></div><div className="control"><label>Territory</label><select value={state} onChange={(e) => setState(e.target.value)}>{STATES.map((s) => <option key={s}>{s}</option>)}</select></div><div className="control"><label>Minimum score</label><input type="range" min="0" max="100" value={minScore} onChange={(e) => setMinScore(Number(e.target.value))}/><span className="rangeValue">{minScore}</span></div><label className="check"><input type="checkbox" checked={ammoniaOnly} onChange={(e) => setAmmoniaOnly(e.target.checked)} /> Ammonia only</label><a className="check filterTab" href="/filters">☷ Target Filters</a></section>
+      <section className="controls"><div className="control wide"><label>Search facilities</label><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="cold storage, food processing, company, city…" /></div><div className="control"><label>Territory</label><select value={state} onChange={(e) => setState(e.target.value)}>{STATES.map((s) => <option key={s}>{s}</option>)}</select></div><div className="control"><label>Minimum score</label><input type="range" min="0" max="100" value={minScore} onChange={(e) => setMinScore(Number(e.target.value))}/><span className="rangeValue">{minScore}</span></div><label className="check"><input type="checkbox" checked={ammoniaOnly} onChange={(e) => setAmmoniaOnly(e.target.checked)} /> Ammonia only</label><a className="check filterTab" href="/filters">☷ Target Filters{filterCount ? ` (${filterCount})` : ""}</a></section>
       <section className="actions"><button className="primary" onClick={discoverTerritory} disabled={discovering}>{discovering ? "Deep searching…" : `Deep Search ${state === STATES[0] ? "the West" : state}`}</button><span>{progress || `Search cycle ${sweep + 1}. One click runs the full discovery sweep using larger internal research packs.`}</span></section>
       {error && <div className="errorBox">{error}</div>}
       <section className="stats"><div className="stat"><span>Showing</span><strong>{filtered.length}</strong></div><div className="stat"><span>New last search</span><strong>{newCount}</strong></div><div className="stat"><span>Lifetime prospects</span><strong>{territoryMemoryCount}</strong></div><div className="stat"><span>Saved</span><strong>{savedCount}</strong></div></section>
