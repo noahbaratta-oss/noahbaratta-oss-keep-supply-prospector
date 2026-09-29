@@ -52,7 +52,7 @@ export const FACILITY_TYPES: Array<{ type: string; base: number; re: RegExp; buy
   { type: "Ice Cream / Frozen Dessert", base: 70, re: /(ice cream|frozen dessert|gelato plant|311520)/i, buyer: "Engineering Manager" },
   { type: "Dairy Processing", base: 68, re: /(dairy|milk|cheese|yogurt|creamery|butter|whey|311511|311512|311513|311514)/i, buyer: "Plant Engineer / Engineering Manager" },
   { type: "Frozen Food / Produce Processing", base: 70, re: /(frozen food|frozen (fruit|vegetable|potato)|french fr|potato process|vegetable process|iqf|311411|311412|311423)/i, buyer: "Plant Engineer / Refrigeration Supervisor" },
-  { type: "Produce Packing / Storage", base: 64, re: /(produce|fruit pack|packing house|packinghouse|apple storage|controlled atmosphere|onion storage|leafy green|115114|424480)/i, buyer: "Facilities / Refrigeration Supervisor" },
+  { type: "Produce Packing / Storage", base: 64, re: /(fresh produce|produce (packing|packer|company|distribut|cold storage|warehouse|shipper|grower|house)|fruit pack|packing house|packinghouse|apple storage|controlled atmosphere|onion storage|leafy green|115114|424480)/i, buyer: "Facilities / Refrigeration Supervisor" },
   { type: "Food Distribution Center", base: 60, re: /(food distribution|foodservice distribution|grocery distribution|distribution center|424410|424420|424430|424470)/i, buyer: "Facilities Manager / Maintenance Manager" },
   { type: "Brewery", base: 55, re: /(brewery|brewing|312120)/i, buyer: "Brewmaster / Maintenance Manager" },
   { type: "Distillery", base: 50, re: /(distiller|spirits|whiskey|vodka|312140)/i, buyer: "Operations / Maintenance Manager" },
@@ -68,6 +68,14 @@ export const FACILITY_TYPES: Array<{ type: string; base: number; re: RegExp; buy
 ];
 
 export const UNCLASSIFIED = "Industrial Facility (unclassified)";
+
+// Web results must mention an industrial-refrigeration market or facility in their own title/snippet;
+// generic pages that merely share a city or brand word (tourism, music, law firms…) are rejected.
+const STRONG_WEB_RE = /(cold storage|refrigerat|freezer|frozen|ammonia|cold chain|temperature[- ]controlled|meat (packing|packer|processing|company|plant)|beef (plant|packing|processing)|pork (plant|processing)|poultry|slaughter|packing (plant|house|company|shed)|packinghouse|processing (plant|facility|company)|food (processing|manufactur|plant|distribution)|foodservice distribution|dairy (plant|processing|farm|cooperative|co-op|products)|creamery|cheese (plant|company|factory|maker)|ice cream|brewery|brewing (company|co)|distillery|bottling|beverage (plant|manufactur|company)|seafood|fish processing|potato (processing|plant)|fruit (packing|storage)|refrigerated warehouse|distribution center|3pl|pharmaceutical|biotech|vaccine|industrial gas|chemical plant|rendering (plant|company)|ice (company|plant|manufactur))/i;
+
+export function isRelevantWebText(text: string): boolean {
+  return STRONG_WEB_RE.test(text);
+}
 
 export function classifyFacility(text: string): { type: string; base: number; buyer: string } {
   const hit = FACILITY_TYPES.find((f) => f.re.test(text));

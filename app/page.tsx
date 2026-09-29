@@ -5,7 +5,8 @@ import type { DiscoverResponse, DiscoverTask, Prospect, ProviderLog } from "../l
 import { ALL_WESTERN, TERRITORY_OPTIONS } from "../lib/geo";
 import { buildPlan, type Depth } from "../lib/plan";
 import { SEED_VERSION, mergeIntoLifetime, mergeProspect, westernSeedProspects } from "../lib/merge";
-import { deleteRecord, loadState, putRecords, setMeta } from "../lib/store";
+import { isRelevantWebText } from "../lib/classify";
+import { deleteRecord, getMeta, loadState, putRecords, setMeta } from "../lib/store";
 import { LS, download, fmt, parseFacilityList, readLs, selectedTargets, toCsv, writeLs } from "../lib/client-utils";
 import Dossier from "./Dossier";
 
@@ -109,6 +110,18 @@ export default function Home() {
           const { changed } = mergeIntoLifetime(lifetimeRef.current, westernSeedProspects());
           await putRecords("lifetime", changed);
           await setMeta("seedVersion", SEED_VERSION);
+        }
+        // One-time cleanup: drop web-only records that fail the stricter relevance check
+        // (never touches saved, seed-list, registry or researched records).
+        if ((await getMeta<number>("webFilterVersion", 0)) < 2) {
+          const junk = Object.values(lifetimeRef.current).filter((p) =>
+            !s.saved[p.key] && !p.inSeedList && !p.lastResearched &&
+            (p.providers || []).every((x) => x === "Web search") &&
+            !isRelevantWebText((p.evidence || []).map((e) => `${e.label} ${e.detail || ""}`).join(" ")));
+          for (const p of junk) { delete lifetimeRef.current[p.key]; await deleteRecord("lifetime", p.key); }
+          s.lastSearch = (s.lastSearch || []).filter((r) => !((r.providers || []).every((x) => x === "Web search") && !isRelevantWebText((r.evidence || []).map((e) => `${e.label} ${e.detail || ""}`).join(" "))));
+          s.lastSearchNew = (s.lastSearchNew || []).filter((k) => lifetimeRef.current[k]);
+          await Promise.all([setMeta("webFilterVersion", 2), setMeta("lastSearch", s.lastSearch), setMeta("lastSearchNew", s.lastSearchNew)]);
         }
         memoryRef.current = s.memory || {};
         sweepRef.current = s.sweep || 0;

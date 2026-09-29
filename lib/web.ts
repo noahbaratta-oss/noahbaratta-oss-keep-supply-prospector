@@ -4,7 +4,7 @@
 
 import type { Evidence, Prospect, ProviderLog } from "./types";
 import { fetchText, looksBlocked } from "./http";
-import { classifyFacility, facilityKey, finalize, normName, refrigerationLabel, textSignals, UNCLASSIFIED } from "./classify";
+import { classifyFacility, facilityKey, finalize, isRelevantWebText, normName, refrigerationLabel, textSignals, UNCLASSIFIED } from "./classify";
 import { detectCity, detectState, isWesternState } from "./geo";
 import { crossReferenceSeed } from "./merge";
 import { targetsMatching } from "./providers";
@@ -297,6 +297,7 @@ export function hitToRecord(hit: Hit, stateHint: string, targets: string[]): Pro
   if (detected !== "Unknown" && !isWesternState(detected)) return null; // outside territory
   const state = detected !== "Unknown" ? detected : stateHint;
   if (!isWesternState(state)) return null;
+  if (!isRelevantWebText(text)) return null;
   const type = classifyFacility(text);
   if (type.type === UNCLASSIFIED && !sig.refrigerationHits && !sig.ammonia) return null;
   const city = detectCity(text, state);
