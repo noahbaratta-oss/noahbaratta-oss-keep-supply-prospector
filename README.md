@@ -1,22 +1,56 @@
 # Keep Supply Prospector
 
-AI-powered industrial refrigeration prospecting for the Western U.S.
+Western U.S. industrial-refrigeration prospecting engine (Next.js on Vercel, `main` = production).
 
 ## Qualification rules
 
-- Industrial refrigeration is the primary prospecting target.
-- Ammonia is a technology signal, not a requirement.
-- The 10,000 lb threshold applies **only when ammonia is present** and evidence supports evaluating system charge.
-- Non-ammonia refrigeration prospects can still receive a high score.
+- Industrial refrigeration is the primary qualification. Ammonia is a signal, not a requirement.
+- The 10,000-lb threshold applies **only when ammonia is present** and a public document states the quantity.
+- Ammonia is `Confirmed` only with public evidence (EPA TRI ammonia report, a government page, or the company's own page). Seed-list NH3 = `Likely`.
+- Nothing is invented: unknown fields show `Unknown`, `Not found` or `Needs verification`.
 
-## Research sources planned
+## Data pipeline
 
-Public web search, company/facility websites, EPA RMP and Envirofacts data, OSHA/public safety records, state environmental sources, public PDFs/news/expansion records, and optional map/place data.
+```
+Deep Search plan (territory × target filters × depth)
+  → research packs (/api/research mode "task"), run 4 at a time by the browser
+      USDA FSIS MPI Directory (meat/poultry establishments, per state)
+      EPA TRI basic data — ammonia (CAS 7664-41-7) reporters, per state
+      EPA ECHO facility search — by NAICS codes mapped from target filters
+      OpenStreetMap (Overpass) — mapped facilities by tag
+      Public web discovery — Bing, DuckDuckGo, Yahoo, Mojeek, Startpage (+ optional Brave / Google CSE keys)
+  → DISCOVERY RECORDS  → Search Results (every record, 100 per page, no cap)
+  → normalize + dedupe by facility (company + city + state) → LIFETIME (IndexedDB)
+```
 
-## Deployment
+Each provider is independent: failures are logged in the **Sources** panel and never stop a sweep. If the free search engines block the server, the remaining web packs are skipped automatically.
 
-Hosted web application on Vercel. End users should only need a browser.
+**Research Now** (dossier) runs the recursive pass: `"Company" refrigeration / ammonia / cold storage / facility / plant / permit / RMP / PSM / expansion / PDF`, plus EPA ECHO, EPA TRI and USDA FSIS name lookups and a scan of relevant public pages. Other facilities found for the same company are added to Lifetime.
 
-## Live research
+## Tabs
 
-The hosted research route expects the `OPENAI_API_KEY` environment variable in Vercel. Environment variables are server-side and are never exposed to the browser.
+- **Deep Search** — every discovery record from the latest sweep (toggle "Unique facilities only").
+- **Lifetime** — everything ever discovered, deduplicated, with merged evidence.
+- **New From Last Search** — facilities first discovered in the latest sweep.
+- **Saved** — prospects you starred.
+
+## Persistence
+
+Lifetime, Saved, the latest search and search memory are stored in the browser (IndexedDB database `keep-supply-prospector-db-v2`, stores `lifetime`, `saved`, `meta`). Data from the previous snapshot format and older localStorage keys is migrated automatically and left in place. Use **Data tools → Download backup** to move Lifetime between browsers until a server-side datastore is added.
+
+## Keep Supply seed list
+
+`lib/external-prospects.ts` is the imported Keep Supply list. Western-territory rows are merged into Lifetime (duplicates combined); discoveries that match a seed account inherit its sales fields (buyer type, parts opportunity, OEMs, cold-call priority, sales approach). Out-of-territory rows stay in the file untouched.
+
+## Target Filters
+
+`lib/target-filters.ts` defines every target type → web search terms, NAICS codes (EPA), USDA FSIS inclusion and OpenStreetMap tags. Add new types there, or add custom types in the Target Filters workspace.
+
+## Optional environment variables (Vercel)
+
+| Variable | Purpose |
+| --- | --- |
+| `BRAVE_SEARCH_API_KEY` | Brave Search API (free tier) for reliable web discovery |
+| `GOOGLE_CSE_KEY` + `GOOGLE_CSE_CX` | Google Programmable Search (free daily quota) |
+
+No paid service is required. `GET /api/research?probe=1` runs a live health check of every source from the server.
