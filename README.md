@@ -14,16 +14,19 @@ Western U.S. industrial-refrigeration prospecting engine (Next.js on Vercel, `ma
 ```
 Deep Search plan (territory × target filters × depth)
   → research packs (/api/research mode "task"), run 4 at a time by the browser
-      USDA FSIS MPI Directory (meat/poultry establishments, per state)
+      USDA FSIS MPI Directory (meat/poultry establishments + import cold storages, per state;
+        live download, falling back to the bundled Western snapshot lib/fsis-west.json because FSIS returns 403 to Vercel)
       EPA TRI basic data — ammonia (CAS 7664-41-7) reporters, per state
       EPA ECHO facility search — by NAICS codes mapped from target filters
       OpenStreetMap (Overpass) — mapped facilities by tag
       Public web discovery — Bing, DuckDuckGo, Yahoo, Mojeek, Startpage (+ optional Brave / Google CSE keys)
   → DISCOVERY RECORDS  → Search Results (every record, 100 per page, no cap)
-  → normalize + dedupe by facility (company + city + state) → LIFETIME (IndexedDB)
+  → normalize + dedupe by facility → LIFETIME (IndexedDB)
+      same facility = same name+city+state, OR shared EPA FRS / TRI / FSIS id,
+      OR same ZIP + street number with a distinctive name word in common
 ```
 
-Each provider is independent: failures are logged in the **Sources** panel and never stop a sweep. If the free search engines block the server, the remaining web packs are skipped automatically.
+Each provider is independent: failures are logged in the **Sources** panel and never stop a sweep. A source that keeps failing during a sweep (OpenStreetMap after 2 packs, EPA ECHO after 5, web engines after 10 empty packs) is skipped for the rest of that sweep. From Vercel, Bing and Marginalia answer; DuckDuckGo/Mojeek return 403 and Yahoo/Startpage/Google return nothing usable. Web results must mention an industrial-refrigeration market or facility in their own title/snippet.
 
 **Research Now** (dossier) runs the recursive pass: `"Company" refrigeration / ammonia / cold storage / facility / plant / permit / RMP / PSM / expansion / PDF`, plus EPA ECHO, EPA TRI and USDA FSIS name lookups and a scan of relevant public pages. Other facilities found for the same company are added to Lifetime.
 
