@@ -279,8 +279,11 @@ export default function Home() {
     let done = 0;
     let webDone = 0;
     let webHits = 0;
-    let skipWeb = false;
     let lastPersist = Date.now();
+    // Sources that keep failing (overloaded / blocking the server) are skipped for the rest of the sweep.
+    const skipKinds = new Set<string>();
+    const failStreak: Record<string, number> = {};
+    const SKIP_AFTER: Record<string, number> = { osm: 2, echo: 5 };
     const lt = lifetimeRef.current;
 
     const record = (logs: ProviderLog[]) => {
@@ -331,23 +334,37 @@ export default function Home() {
         const idx = queue.findIndex((t) => t.kind !== "osm" || osmActive < 1);
         if (idx < 0) { await new Promise((r) => setTimeout(r, 400)); continue; }
         const task = queue.splice(idx, 1)[0];
-        if (task.kind === "web" && skipWeb) { done++; continue; }
+        if (skipKinds.has(task.kind)) { done++; continue; }
         if (task.kind === "osm") osmActive++;
         setProgress(`Pack ${done + 1}/${plan.length} · ${task.label} · ${fmt(records.length)} discovery records · ${fmt(newKeys.size)} new facilities`);
+        let failed = false;
         try {
           const r = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "task", task, targets, ammoniaOnly, providers }) });
           const d = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
-          if (!r.ok) record([{ provider: task.label, ok: false, status: "error", count: 0, ms: 0, detail: d.error || `HTTP ${r.status}` }]);
-          else await handle(task, d as DiscoverResponse);
+          if (!r.ok) {
+            failed = true;
+            record([{ provider: task.label, ok: false, status: "error", count: 0, ms: 0, detail: d.error || `HTTP ${r.status}` }]);
+          } else {
+            const res = d as DiscoverResponse;
+            failed = (res.diagnostics || []).length > 0 && (res.diagnostics || []).every((x) => !x.ok);
+            await handle(task, res);
+          }
         } catch (e) {
+          failed = true;
           record([{ provider: task.label, ok: false, status: "error", count: 0, ms: 0, detail: e instanceof Error ? e.message : "network error" }]);
         } finally {
           if (task.kind === "osm") osmActive--;
           done++;
+          failStreak[task.kind] = failed ? (failStreak[task.kind] || 0) + 1 : 0;
+          const limit = SKIP_AFTER[task.kind];
+          if (limit && failStreak[task.kind] >= limit && !skipKinds.has(task.kind)) {
+            skipKinds.add(task.kind);
+            record([{ provider: task.kind === "osm" ? "OpenStreetMap" : "EPA ECHO", ok: false, status: "skipped", count: 0, ms: 0, detail: `${limit} packs in a row failed (source overloaded or unavailable); remaining packs skipped this sweep` }]);
+          }
           // If the first 10 web packs return nothing from any engine, the engines are blocking
           // the server — skip the remaining web packs instead of waiting on them.
-          if (task.kind === "web" && webDone >= 10 && webHits === 0 && !skipWeb) {
-            skipWeb = true;
+          if (task.kind === "web" && webDone >= 10 && webHits === 0 && !skipKinds.has("web")) {
+            skipKinds.add("web");
             record([{ provider: "Web discovery", ok: false, status: "skipped", count: 0, ms: 0, detail: "Search engines returned no results to the server; remaining web packs skipped. Add a Brave or Google API key for reliable web search." }]);
           }
         }

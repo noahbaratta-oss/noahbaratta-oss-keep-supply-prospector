@@ -11,6 +11,7 @@ import { classifyFacility, facilityKey, facilityTypeFromNaics, finalize, UNCLASS
 import { ABBR_STATE, STATE_ABBR, titleCase } from "./geo";
 import { DEFAULT_TARGETS, TARGET_DEFS, defFor, fsisModeFor, naicsFor, osmClausesFor } from "./target-filters";
 import { crossReferenceSeed } from "./merge";
+import FSIS_SNAPSHOT from "./fsis-west.json";
 
 type Result = { records: Prospect[]; log: ProviderLog; rawHits: number };
 
@@ -75,11 +76,18 @@ const num = (v: unknown) => {
 const FSIS_CSV = "https://www.fsis.usda.gov/sites/default/files/media_file/documents/MPI_Directory_by_Establishment_Name.csv";
 const FSIS_PAGE = "https://www.fsis.usda.gov/inspection/establishments/meat-poultry-and-egg-product-inspection-directory";
 
-async function loadFsis(): Promise<Array<Record<string, string>>> {
+type FsisData = { rows: Array<Record<string, string>>; origin: "live" | "snapshot"; detail: string };
+
+// Live USDA download first; FSIS blocks some cloud servers (HTTP 403), so fall back to the
+// bundled Western-territory snapshot (lib/fsis-west.json) instead of returning nothing.
+async function loadFsis(): Promise<FsisData> {
   return cached("fsis-mpi", 12 * 3600_000, async () => {
-    const r = await fetchText(FSIS_CSV, { timeout: 25000 });
-    if (!r.ok || r.text.length < 1000) throw new Error(r.error || `HTTP ${r.status}`);
-    return csvObjects(r.text);
+    const r = await fetchText(FSIS_CSV, { timeout: 12000, headers: { Accept: "text/csv,text/plain,*/*" } });
+    if (r.ok && r.text.length > 1000 && /establishment_name/i.test(r.text.slice(0, 500))) {
+      return { rows: csvObjects(r.text), origin: "live" as const, detail: "live USDA download" };
+    }
+    const why = r.error || `HTTP ${r.status}`;
+    return { rows: csvObjects(FSIS_SNAPSHOT.csv), origin: "snapshot" as const, detail: `USDA snapshot ${FSIS_SNAPSHOT.retrieved} (live download unavailable: ${why})` };
   });
 }
 
@@ -88,28 +96,33 @@ export async function fsisProvider(states: string[], targets: string[]): Promise
   const mode = fsisModeFor(targets.length ? targets : DEFAULT_TARGETS);
   if (mode === "none") return { records: [], rawHits: 0, log: { provider: "USDA FSIS", ok: true, status: "skipped", count: 0, ms: 0, detail: "No meat/poultry targets selected" } };
   try {
-    const rows = await loadFsis();
+    const data = await loadFsis();
+    const rows = data.rows;
     const abbrs = new Set(states.map((s) => STATE_ABBR[s]).filter(Boolean));
     const records: Prospect[] = [];
     for (const row of rows) {
       if (!abbrs.has(row.state)) continue;
       const act = row.activities || "";
-      if (mode === "meat" && !/meat/i.test(act)) continue;
+      const importHouse = /import/i.test(act) && !/processing|slaughter/i.test(act);
+      if (mode === "meat" && !/meat/i.test(act) && !importHouse) continue;
       if (mode === "poultry" && !/poultry/i.test(act)) continue;
       const rawName = row.establishment_name || "";
       const prefix = rawName.match(/^\(([^)]+)\)\s*-\s*(.+)$/);
-      const name = (prefix ? prefix[2] : rawName).trim();
+      const name = (prefix ? prefix[2] : rawName).trim().replace(/[\s,;:]+$/, "");
       const slaughter = /slaughter/i.test(act);
       const poultryOnly = /poultry/i.test(act) && !/meat/i.test(act);
       const typeText = `${name} ${row.dbas || ""}`;
       let type = classifyFacility(typeText);
-      if (type.type === UNCLASSIFIED || type.type === "Food Ingredient / Other Food Manufacturing") {
+      if (importHouse && type.type !== "Cold Storage / Refrigerated Warehouse") {
+        // FSIS official import inspection establishments are typically cold-storage warehouses.
+        type = classifyFacility("cold storage");
+      } else if (type.type === UNCLASSIFIED || type.type === "Food Ingredient / Other Food Manufacturing") {
         type = classifyFacility(poultryOnly ? "poultry processing" : /egg/i.test(act) && !/meat|poultry/i.test(act) ? "food manufacturing egg products" : "meat processing");
       }
       const actSummary = act.split(";").map((s) => s.trim()).filter(Boolean).slice(0, 8).join("; ");
       const ev: Evidence = {
-        label: `USDA FSIS inspected establishment ${row.establishment_number}`,
-        detail: `Activities: ${actSummary || "n/a"} · HACCP size: ${row.size || "n/a"} · Grant date: ${row.grant_date || "n/a"}${row.dbas ? ` · DBAs: ${row.dbas}` : ""}`,
+        label: `USDA FSIS inspected establishment ${row.establishment_number}${importHouse ? " (official import inspection establishment)" : ""}`,
+        detail: `Activities: ${actSummary || "n/a"} · HACCP size: ${row.size || "n/a"} · Grant date: ${row.grant_date || "n/a"}${row.dbas ? ` · DBAs: ${row.dbas}` : ""} · Source: ${data.origin === "live" ? "live USDA directory" : `USDA directory snapshot ${FSIS_SNAPSHOT.retrieved}`}`,
         url: FSIS_PAGE,
         source: "USDA FSIS MPI Directory",
         kind: "registry",
@@ -126,8 +139,8 @@ export async function fsisProvider(states: string[], targets: string[]): Promise
         lat: num(row.latitude),
         lon: num(row.longitude),
         facilityType: type.type,
-        industry: `${slaughter ? "Slaughter & processing" : "Processing"} — ${poultryOnly ? "poultry" : /meat/i.test(act) ? "meat" : "egg/other"} (USDA FSIS)`,
-        refrigeration: "Refrigerated meat/poultry processing — system type not found",
+        industry: importHouse ? "USDA official import inspection establishment (meat/poultry cold storage)" : `${slaughter ? "Slaughter & processing" : "Processing"} — ${poultryOnly ? "poultry" : /meat/i.test(act) ? "meat" : "egg/other"} (USDA FSIS)`,
+        refrigeration: importHouse ? "Refrigerated/frozen import storage — system type not found" : "Refrigerated meat/poultry processing — system type not found",
         sizeClass: row.size || undefined,
         evidence: [ev],
         sourceUrls: [FSIS_PAGE],
@@ -137,7 +150,7 @@ export async function fsisProvider(states: string[], targets: string[]): Promise
         source: "USDA FSIS MPI Directory",
       }));
     }
-    return { records, rawHits: records.length, log: { provider: "USDA FSIS", ok: true, status: records.length ? "ok" : "empty", count: records.length, ms: Date.now() - started } };
+    return { records, rawHits: records.length, log: { provider: "USDA FSIS", ok: true, status: records.length ? "ok" : "empty", count: records.length, ms: Date.now() - started, detail: data.detail } };
   } catch (e) {
     return { records: [], rawHits: 0, log: { provider: "USDA FSIS", ok: false, status: "error", count: 0, ms: Date.now() - started, detail: e instanceof Error ? e.message : "failed" } };
   }
@@ -234,17 +247,28 @@ const ECHO = "https://echodata.epa.gov/echo/echo_rest_services";
 
 type EchoFacility = Record<string, string | null>;
 
-export async function echoQuery(params: string, timeout = 25000): Promise<EchoFacility[]> {
-  const first = await fetchText(`${ECHO}.get_facilities?output=JSON&${params}`, { timeout });
-  if (!first.ok) throw new Error(first.error || `HTTP ${first.status}`);
+// ECHO is intermittently overloaded (HTTP 503 / timeouts), so retry with a short backoff.
+async function echoFetch(url: string, timeout: number, attempts = 3) {
+  let last = { ok: false, status: 0, text: "", ms: 0, error: "" } as Awaited<ReturnType<typeof fetchText>>;
+  for (let i = 0; i < attempts; i++) {
+    last = await fetchText(url, { timeout });
+    if (last.ok && last.text.trim().startsWith("{")) return last;
+    if (last.status && last.status < 500 && last.status !== 429) break;
+    await new Promise((r) => setTimeout(r, 1200 * (i + 1)));
+  }
+  throw new Error(last.error || `HTTP ${last.status}`);
+}
+
+export async function echoQuery(params: string, timeout = 15000): Promise<EchoFacility[]> {
+  const first = await echoFetch(`${ECHO}.get_facilities?output=JSON&${params}`, timeout);
   const j = JSON.parse(first.text);
   const qid = j?.Results?.QueryID;
   const rows = Number(j?.Results?.QueryRows || 0);
   if (!qid || !rows) return [];
   const out: EchoFacility[] = [];
   for (let page = 1; page <= 6 && out.length < rows; page++) {
-    const r = await fetchText(`${ECHO}.get_qid?output=JSON&qid=${qid}&pageno=${page}`, { timeout });
-    if (!r.ok) break;
+    const r = await echoFetch(`${ECHO}.get_qid?output=JSON&qid=${qid}&pageno=${page}`, timeout, 2).catch(() => null);
+    if (!r) break;
     const f = JSON.parse(r.text)?.Results?.Facilities || [];
     if (!f.length) break;
     out.push(...f);
@@ -304,17 +328,17 @@ export async function echoProvider(state: string, naics: string[], targets: stri
 // OpenStreetMap via Overpass
 // ---------------------------------------------------------------------------
 
-const OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter", "https://overpass.private.coffee/api/interpreter"];
+const OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"];
 
 export async function osmProvider(state: string, targets: string[]): Promise<Result> {
   const started = Date.now();
   const abbr = STATE_ABBR[state];
   const clauses = osmClausesFor(targets.length ? targets : DEFAULT_TARGETS);
   if (!clauses.length) return { records: [], rawHits: 0, log: { provider: "OpenStreetMap", ok: true, status: "skipped", count: 0, ms: 0, detail: "No map tags for selected targets" } };
-  const query = `[out:json][timeout:30];area["ISO3166-2"="US-${abbr}"]->.a;(${clauses.map((c) => `${c}(area.a);`).join("")});out center tags 1500;`;
+  const query = `[out:json][timeout:22];area["ISO3166-2"="US-${abbr}"]->.a;(${clauses.map((c) => `${c}(area.a);`).join("")});out center tags 1500;`;
   let lastErr = "";
   for (const [i, endpoint] of OVERPASS.entries()) {
-    const r = await fetchText(endpoint, { method: "POST", body: `data=${encodeURIComponent(query)}`, headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: i === 0 ? 32000 : 14000 });
+    const r = await fetchText(endpoint, { method: "POST", body: `data=${encodeURIComponent(query)}`, headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: i === 0 ? 25000 : 20000 });
     if (!r.ok) { lastErr = r.error || `HTTP ${r.status}`; continue; }
     try {
       const j = JSON.parse(r.text);

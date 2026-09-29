@@ -1,7 +1,9 @@
 // Server-side HTTP helper with timeouts, block detection, and a small in-memory cache
 // (per warm serverless instance) for large public datasets.
 
-export const USER_AGENT = "KeepSupplyProspector/3.0 (+https://keep-supply-prospector.vercel.app; public-data research)";
+// "Mozilla/5.0 (compatible; …)" is the conventional form for identified automated clients; some
+// government CDNs reject user agents that do not start with it.
+export const USER_AGENT = "Mozilla/5.0 (compatible; KeepSupplyProspector/3.1; +https://keep-supply-prospector.vercel.app)";
 
 export type FetchResult = { ok: boolean; status: number; text: string; ms: number; error?: string };
 

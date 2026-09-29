@@ -200,7 +200,7 @@ export function scoreProspect(p: Prospect): { score: number; priority: Priority;
   const providers = new Set(p.providers || []);
   score += Math.min(12, Math.max(0, providers.size - 1) * 4);
   if (providers.size === 1 && providers.has("Web search") && (p.evidence || []).length <= 1) score -= 5;
-  if (/^\d+\s/.test(p.name)) score -= 10; // registry name is a street address
+  if (/^\d+\s+(\w+\s+){0,3}(st|street|ave|avenue|rd|road|blvd|boulevard|way|dr|drive|ln|lane|hwy|highway|pkwy|parkway|ct|court|pl|place|loop|cir|circle)\b/i.test(p.name)) score -= 10; // registry name is a street address
 
   if (p.inSeedList) {
     const ps = Number(p.seedPriorityScore || 0);

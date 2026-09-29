@@ -69,8 +69,10 @@ export const TARGET_GROUPS: Record<string, string[]> = {
   ],
 };
 
-const OSM_COLD_NAMES = `nwr["building"~"^(warehouse|industrial)$"]["name"~"cold storage|refrigerat|freez|frozen|cold chain",i]`;
-const OSM_FOOD_PLANT_NAMES = `nwr["building"~"^(warehouse|industrial)$"]["name"~"packing|processing|foods|meats|creamery|dairy|cheese",i]`;
+// Exact tag matches first (indexed on Overpass), then a name filter — far faster than a value regex.
+const OSM_COLD_NAMES = `nwr["building"="warehouse"]["name"~"cold storage|refrigerat|freez|frozen|cold chain",i]`;
+const OSM_COLD_NAMES_IND = `nwr["building"="industrial"]["name"~"cold storage|refrigerat|freez|frozen",i]`;
+const OSM_FOOD_PLANT_NAMES = `nwr["building"="industrial"]["name"~"packing|processing|foods|meats|creamery|dairy|cheese",i]`;
 
 export const TARGET_DEFS: Record<string, TargetDef> = {
   // Meat / Protein
@@ -86,17 +88,17 @@ export const TARGET_DEFS: Record<string, TargetDef> = {
   "Large butcher/processing operations": { aliases: ["meat processing company", "custom meat processing plant"], naics: ["311612"], fsis: "meat" },
 
   // Cold storage / distribution
-  "Cold storage warehouses": { aliases: ["cold storage warehouse", "cold storage facility"], naics: ["493120"], osm: [OSM_COLD_NAMES] },
-  "Frozen food warehouses": { aliases: ["frozen food warehouse", "freezer warehouse"], naics: ["493120", "424420"], osm: [OSM_COLD_NAMES] },
-  "Refrigerated distribution centers": { aliases: ["refrigerated distribution center", "refrigerated warehouse"], naics: ["493120"], osm: [OSM_COLD_NAMES] },
+  "Cold storage warehouses": { aliases: ["cold storage warehouse", "cold storage facility"], naics: ["493120"], osm: [OSM_COLD_NAMES, OSM_COLD_NAMES_IND] },
+  "Frozen food warehouses": { aliases: ["frozen food warehouse", "freezer warehouse"], naics: ["493120", "424420"], osm: [OSM_COLD_NAMES, OSM_COLD_NAMES_IND] },
+  "Refrigerated distribution centers": { aliases: ["refrigerated distribution center", "refrigerated warehouse"], naics: ["493120"], osm: [OSM_COLD_NAMES, OSM_COLD_NAMES_IND] },
   "Temperature-controlled logistics": { aliases: ["temperature controlled warehouse", "cold chain logistics"], naics: ["493120"] },
   "3PL cold storage": { aliases: ["3PL cold storage", "third party cold storage"], naics: ["493120"] },
   "Food distribution centers": { aliases: ["food distribution center", "foodservice distribution center"], naics: ["424410", "424420", "424430", "424480"] },
-  "Frozen storage facilities": { aliases: ["frozen storage facility", "freezer storage"], naics: ["493120"], osm: [OSM_COLD_NAMES] },
+  "Frozen storage facilities": { aliases: ["frozen storage facility", "freezer storage"], naics: ["493120"], osm: [OSM_COLD_NAMES, OSM_COLD_NAMES_IND] },
   "Produce cold storage": { aliases: ["produce cold storage", "fruit cold storage", "controlled atmosphere storage"], naics: ["493120", "424480", "115114"] },
   "Meat cold storage": { aliases: ["meat cold storage", "protein cold storage"], naics: ["493120", "424470"] },
   "Pharmaceutical cold storage": { aliases: ["pharmaceutical cold storage", "pharma cold chain warehouse"], naics: ["493120", "424210"] },
-  "Regional refrigerated warehouses": { aliases: ["refrigerated warehouse", "public refrigerated warehouse"], naics: ["493120"], osm: [OSM_COLD_NAMES] },
+  "Regional refrigerated warehouses": { aliases: ["refrigerated warehouse", "public refrigerated warehouse"], naics: ["493120"], osm: [OSM_COLD_NAMES, OSM_COLD_NAMES_IND] },
 
   // Dairy
   "Milk processors": { aliases: ["milk processing plant", "fluid milk plant"], naics: ["311511"], osm: [`nwr["industrial"="dairy"]`] },
@@ -131,7 +133,7 @@ export const TARGET_DEFS: Record<string, TargetDef> = {
   "Barrel aging": { aliases: ["barrel aging warehouse", "barrel house"], naics: ["312140"] },
   Fermentation: { aliases: ["fermentation plant", "fermentation cellar"], naics: ["312120", "312130"] },
   "Packaging line": { aliases: ["food packaging plant", "packaging line refrigeration"] },
-  "Cold storage": { aliases: ["cold storage", "refrigerated warehouse"], naics: ["493120"], osm: [OSM_COLD_NAMES] },
+  "Cold storage": { aliases: ["cold storage", "refrigerated warehouse"], naics: ["493120"], osm: [OSM_COLD_NAMES, OSM_COLD_NAMES_IND] },
   "Industrial refrigeration": { aliases: ["industrial refrigeration", "industrial refrigeration system"] },
   Ammonia: { aliases: ["ammonia refrigeration", "anhydrous ammonia refrigeration system", "ammonia RMP"] },
   "CO₂ refrigeration": { aliases: ["CO2 refrigeration", "transcritical CO2 refrigeration", "carbon dioxide refrigeration"] },
