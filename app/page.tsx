@@ -4,7 +4,7 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } f
 import type { DiscoverResponse, DiscoverTask, Prospect, ProviderLog } from "../lib/types";
 import { ALL_WESTERN, TERRITORY_OPTIONS } from "../lib/geo";
 import { buildPlan, type Depth } from "../lib/plan";
-import { SEED_VERSION, mergeIntoLifetime, mergeProspect, westernSeedProspects } from "../lib/merge";
+import { SEED_VERSION, consolidateLifetime, mergeIntoLifetime, mergeProspect, westernSeedProspects } from "../lib/merge";
 import { isRelevantWebText } from "../lib/classify";
 import { deleteRecord, getMeta, loadState, putRecords, setMeta } from "../lib/store";
 import { LS, download, fmt, parseFacilityList, readLs, selectedTargets, toCsv, writeLs } from "../lib/client-utils";
@@ -122,6 +122,28 @@ export default function Home() {
           s.lastSearch = (s.lastSearch || []).filter((r) => !((r.providers || []).every((x) => x === "Web search") && !isRelevantWebText((r.evidence || []).map((e) => `${e.label} ${e.detail || ""}`).join(" "))));
           s.lastSearchNew = (s.lastSearchNew || []).filter((k) => lifetimeRef.current[k]);
           await Promise.all([setMeta("webFilterVersion", 2), setMeta("lastSearch", s.lastSearch), setMeta("lastSearchNew", s.lastSearchNew)]);
+        }
+        // One-time consolidation with the registry-id / address matching rules.
+        if ((await getMeta<number>("dedupeVersion", 0)) < 2) {
+          const { lifetime: next, remap, removed } = consolidateLifetime(lifetimeRef.current);
+          if (removed.length) {
+            lifetimeRef.current = next;
+            await putRecords("lifetime", Object.values(next));
+            for (const k of removed) await deleteRecord("lifetime", k);
+            for (const [from, to] of Object.entries(remap)) {
+              if (s.saved[from]) {
+                s.saved[to] = { ...(next[to] || s.saved[from]), saved: true };
+                delete s.saved[from];
+                await deleteRecord("saved", from);
+                await putRecords("saved", [s.saved[to]]);
+              }
+              if (s.memory && s.memory[from] && !s.memory[to]) s.memory[to] = s.memory[from];
+            }
+            s.lastSearch = (s.lastSearch || []).map((r) => (remap[r.key] ? { ...r, key: remap[r.key] } : r));
+            s.lastSearchNew = [...new Set((s.lastSearchNew || []).map((k) => remap[k] || k))].filter((k) => next[k]);
+            await Promise.all([setMeta("lastSearch", s.lastSearch), setMeta("lastSearchNew", s.lastSearchNew), setMeta("memory", s.memory || {})]);
+          }
+          await setMeta("dedupeVersion", 2);
         }
         memoryRef.current = s.memory || {};
         sweepRef.current = s.sweep || 0;
@@ -324,8 +346,10 @@ export default function Home() {
         const isNew = !priorMemory[rec.key];
         fresh.push({ ...rec, isNew, saved: Boolean(saved[rec.key]) });
       }
+      const { changed, newKeys: nk, redirects } = mergeIntoLifetime(lt, fresh);
+      // Point each discovery record at the Lifetime facility it resolved to.
+      for (const r of fresh) { const k = redirects[r.key] || r.key; r.key = k; r.isNew = !priorMemory[k]; r.saved = Boolean(saved[k]); }
       records.push(...fresh);
-      const { changed, newKeys: nk } = mergeIntoLifetime(lt, fresh);
       const now = Date.now();
       for (const k of nk) { newKeys.add(k); memoryRef.current[k] = memoryRef.current[k] ?? now; }
       for (const r of fresh) memoryRef.current[r.key] = memoryRef.current[r.key] ?? now;

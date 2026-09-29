@@ -67,7 +67,7 @@ export function mergeProspect(base: Prospect | undefined, incoming: Prospect): P
     ...base,
     // Keep the most specific known value for each descriptive field.
     name: base.name || incoming.name,
-    facilityName: known(base.facilityName) || known(incoming.facilityName),
+    facilityName: known(base.facilityName) || known(incoming.facilityName) || (incoming.name && normName(incoming.name) !== normName(base.name) ? incoming.name : undefined),
     city: known(base.city) || incoming.city,
     state: known(base.state) || incoming.state,
     address: known(base.address) || known(incoming.address),
@@ -234,36 +234,108 @@ export function crossReferenceSeed(p: Prospect): Prospect {
   };
 }
 
-// Merge a batch of discovery records into a Lifetime map (mutates and returns the map).
-// Company-level records (city unknown) attach to the single matching facility when there is one.
-export function mergeIntoLifetime(lifetime: Record<string, Prospect>, records: Prospect[], now = Date.now()): { changed: Prospect[]; newKeys: string[] } {
+// ---------------------------------------------------------------------------
+// Lifetime dedupe
+// ---------------------------------------------------------------------------
+// A facility can appear under different names in different sources (e.g. TRI "McCain Foods USA Inc"
+// vs ECHO "McCain Foods USA Burley Facility"). Records resolve to an existing Lifetime facility by:
+//   1. identical facility key (normalized name + city + state)
+//   2. a shared registry id (EPA FRS / TRI / FSIS establishment number)
+//   3. same ZIP + street number AND at least one distinctive name word in common
+//   4. company-level records (city unknown) attach to the company's single known facility
+
+const GENERIC_TOKENS = new Set(["foods", "food", "company", "facility", "plant", "north", "america", "american", "products", "processing", "distribution", "center", "warehouse", "logistics", "cold", "storage", "dairy", "farms", "farm", "meats", "meat", "group", "holdings", "international", "west", "western", "services", "industries", "enterprises", "division", "site", "location"]);
+
+function sigTokens(name: string): string[] {
+  return normName(name).split(" ").filter((t) => t.length >= 4 && !GENERIC_TOKENS.has(t));
+}
+
+function addrKey(p: { address?: string; zip?: string }): string {
+  const num = String(p.address || "").trim().match(/^(\d{1,6})\b/)?.[1];
+  const zip = String(p.zip || "").match(/\d{5}/)?.[0];
+  return num && zip ? `${zip}|${num}` : "";
+}
+
+type FacilityIndex = { byCompany: Map<string, string[]>; byReg: Map<string, string>; byAddr: Map<string, string[]> };
+
+function push(map: Map<string, string[]>, k: string, v: string) {
+  const list = map.get(k);
+  if (list) { if (!list.includes(v)) list.push(v); } else map.set(k, [v]);
+}
+
+function indexFacility(idx: FacilityIndex, key: string, p: Prospect) {
+  const [n, , st] = key.split("|");
+  push(idx.byCompany, `${n}|${st}`, key);
+  for (const id of p.registryIds || []) if (/^(FRS|TRI|FSIS) /.test(id) && !idx.byReg.has(id)) idx.byReg.set(id, key);
+  const a = addrKey(p);
+  if (a) push(idx.byAddr, a, key);
+}
+
+function buildIndex(lifetime: Record<string, Prospect>): FacilityIndex {
+  const idx: FacilityIndex = { byCompany: new Map(), byReg: new Map(), byAddr: new Map() };
+  for (const [k, p] of Object.entries(lifetime)) indexFacility(idx, k, p);
+  return idx;
+}
+
+function resolveKey(lifetime: Record<string, Prospect>, idx: FacilityIndex, r: Prospect): string {
+  const key = r.key || facilityKey(r);
+  if (lifetime[key]) return key;
+  for (const id of r.registryIds || []) {
+    const k = idx.byReg.get(id);
+    if (k && lifetime[k]) return k;
+  }
+  const a = addrKey(r);
+  if (a) {
+    const toks = sigTokens(r.name);
+    const hit = (idx.byAddr.get(a) || []).find((k) => lifetime[k] && sigTokens(lifetime[k].name).some((t) => toks.includes(t)));
+    if (hit) return hit;
+  }
+  const [n, city, st] = key.split("|");
+  if (city === "?") {
+    const facilities = (idx.byCompany.get(`${n}|${st}`) || []).filter((k) => k.split("|")[1] !== "?" && lifetime[k]);
+    if (facilities.length === 1) return facilities[0];
+  }
+  return key;
+}
+
+// Merge a batch of discovery records into a Lifetime map (mutates the map).
+// Returns the changed facilities, the keys that are new to Lifetime, and where each record landed.
+export function mergeIntoLifetime(lifetime: Record<string, Prospect>, records: Prospect[], now = Date.now(), keepTimes = false): { changed: Prospect[]; newKeys: string[]; redirects: Record<string, string> } {
+  return mergeWithIndex(lifetime, buildIndex(lifetime), records, now, keepTimes);
+}
+
+function mergeWithIndex(lifetime: Record<string, Prospect>, idx: FacilityIndex, records: Prospect[], now: number, keepTimes: boolean): { changed: Prospect[]; newKeys: string[]; redirects: Record<string, string> } {
   const changed = new Map<string, Prospect>();
   const newKeys: string[] = [];
-  const byCompany = new Map<string, string[]>();
-  for (const k of Object.keys(lifetime)) {
-    const [n, , st] = k.split("|");
-    const ck = `${n}|${st}`;
-    const list = byCompany.get(ck);
-    if (list) list.push(k); else byCompany.set(ck, [k]);
-  }
+  const redirects: Record<string, string> = {};
   for (const r of records) {
-    let key = r.key || facilityKey(r);
-    const [n, city, st] = key.split("|");
-    if (city === "?") {
-      const facilities = (byCompany.get(`${n}|${st}`) || []).filter((k) => k.split("|")[1] !== "?");
-      if (facilities.length === 1) key = facilities[0];
-    }
+    const original = r.key || facilityKey(r);
+    const key = resolveKey(lifetime, idx, { ...r, key: original });
+    redirects[original] = key;
     const prev = lifetime[key];
-    const merged = mergeProspect(prev, { ...r, key, firstSeen: prev?.firstSeen ?? now, lastSeen: now });
+    const times = keepTimes ? { firstSeen: Math.min(prev?.firstSeen ?? Infinity, r.firstSeen ?? now), lastSeen: Math.max(prev?.lastSeen ?? 0, r.lastSeen ?? now) } : { firstSeen: prev?.firstSeen ?? now, lastSeen: now };
+    const merged = mergeProspect(prev, { ...r, key, ...times });
     merged.key = key;
+    if (keepTimes) { merged.firstSeen = times.firstSeen; merged.lastSeen = times.lastSeen; }
     lifetime[key] = merged;
     changed.set(key, merged);
-    if (!prev) {
-      newKeys.push(key);
-      const ck = `${n}|${st}`;
-      const list = byCompany.get(ck);
-      if (list) list.push(key); else byCompany.set(ck, [key]);
-    }
+    indexFacility(idx, key, merged);
+    if (!prev) newKeys.push(key);
   }
-  return { changed: [...changed.values()], newKeys };
+  return { changed: [...changed.values()], newKeys, redirects };
+}
+
+// Re-run facility resolution over an existing Lifetime (used once after dedupe rules improve).
+export function consolidateLifetime(lifetime: Record<string, Prospect>): { lifetime: Record<string, Prospect>; remap: Record<string, string>; removed: string[] } {
+  const entries = Object.values(lifetime).sort((a, b) => (a.firstSeen || 0) - (b.firstSeen || 0));
+  const next: Record<string, Prospect> = {};
+  const remap: Record<string, string> = {};
+  const idx = buildIndex(next);
+  for (const p of entries) {
+    const { redirects } = mergeWithIndex(next, idx, [p], Date.now(), true);
+    const to = redirects[p.key] || p.key;
+    if (to !== p.key) remap[p.key] = to;
+  }
+  const removed = Object.keys(lifetime).filter((k) => !next[k]);
+  return { lifetime: next, remap, removed };
 }
