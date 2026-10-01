@@ -42,6 +42,20 @@ function defaultProviders(): Record<string, boolean> {
   return Object.fromEntries(PROVIDER_TOGGLES.map((p) => [p.id, p.defaultOn]));
 }
 
+// Every server call gets a deadline so one stalled request can never hang a sweep.
+async function fetchWithTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctl.signal });
+  } catch (e) {
+    if (ctl.signal.aborted) throw new Error(`timed out after ${Math.round(ms / 1000)}s`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function hasAmmonia(p: Prospect) {
   return p.ammonia === "Confirmed" || p.ammonia === "Likely";
 }
@@ -227,6 +241,22 @@ export default function Home() {
           s.lastSearchNew = (s.lastSearchNew || []).filter((k) => lifetimeRef.current[k]);
           await Promise.all([setMeta("webFilterVersion", 2), setMeta("lastSearch", s.lastSearch), setMeta("lastSearchNew", s.lastSearchNew)]);
         }
+        // One-time cleanup: RMP chemical-storage sites (aqueous ammonia at chemical distributors)
+        // that an earlier filter let through.
+        if ((await getMeta<number>("rmpFilterVersion", 0)) < 2) {
+          const bad = Object.values(lifetimeRef.current).filter((p) =>
+            !s.saved[p.key] && !p.inSeedList && (p.providers || []).every((x) => x === "EPA RMP") &&
+            (p.evidence || []).some((e) => /^EPA RMP: Ammonia \(conc/i.test(e.label)) &&
+            !(p.naics || []).some((c) => /^(311|312|49312|49313|4244|4245|115114|42448)/.test(c)));
+          for (const p of bad) { delete lifetimeRef.current[p.key]; await persistDelete("lifetime", p.key); }
+          if (bad.length) {
+            const gone = new Set(bad.map((p) => p.key));
+            s.lastSearch = (s.lastSearch || []).filter((r) => !gone.has(r.key));
+            s.lastSearchNew = (s.lastSearchNew || []).filter((k) => !gone.has(k));
+            await Promise.all([setMeta("lastSearch", s.lastSearch), setMeta("lastSearchNew", s.lastSearchNew)]);
+          }
+          await setMeta("rmpFilterVersion", 2);
+        }
         // One-time consolidation with the registry-id / address matching rules.
         if ((await getMeta<number>("dedupeVersion", 0)) < 2) {
           const { lifetime: next, remap, removed } = consolidateLifetime(lifetimeRef.current);
@@ -383,7 +413,7 @@ export default function Home() {
     const current = lt[p.key] || p;
     setResearchingKey(p.key);
     try {
-      const r = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "research", prospect: current, providers }) });
+      const r = await fetchWithTimeout("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "research", prospect: current, providers }) }, 90_000);
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `Research failed (${r.status})`);
       const enriched: Prospect = mergeProspect(lt[p.key], { ...d.prospect, key: p.key });
@@ -504,7 +534,7 @@ export default function Home() {
             failed = local.diagnostics.every((x) => !x.ok);
             await handle(task, local);
           } else {
-            const r = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "task", task, targets, ammoniaOnly, providers }) });
+            const r = await fetchWithTimeout("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "task", task, targets, ammoniaOnly, providers }) }, 75_000);
             const d = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
             if (!r.ok) {
               failed = true;
@@ -604,7 +634,7 @@ export default function Home() {
       let lines: string[] = [];
       if (visionReady) {
         setImageStatus("Reading the listings with AI…");
-        const r = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "vision", image: base64, mediaType: "image/jpeg" }) });
+        const r = await fetchWithTimeout("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "vision", image: base64, mediaType: "image/jpeg" }) }, 60_000);
         const d = await r.json().catch(() => ({}));
         if (r.ok && Array.isArray(d.lines)) lines = d.lines;
       }

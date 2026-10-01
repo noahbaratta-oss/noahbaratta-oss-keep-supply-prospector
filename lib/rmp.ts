@@ -19,7 +19,7 @@ const viewerUrl = (id: string) => `https://data-liberation-project.github.io/epa
 
 const WEST = new Set(Object.values(STATE_ABBR));
 // Industries where an ammonia RMP process is (almost always) refrigeration.
-const RELEVANT = /^(311|312|4931|4244|4245|115114|42448|72231)/;
+const RELEVANT = /^(311|312|49312|49313|4244|4245|115114|42448|72231)/;
 // Ammonia used as fertilizer, power-plant NOx control, refining, water treatment, chemicals.
 const EXCLUDED = /^(2211|2213|2111|3241|42491|325311|325312|325314|115112|4246|3344|2122|2123|2131|4862|3314|3251)/;
 const NAME_SIGNAL = /cold|storage|frozen|freez|\bice\b|dairy|creamery|cheese|meat|beef|pork|poultry|foods?\b|packing|fruit|produce|brew|winery|seafood|fish|potato|cherry|apple|onion|logistics|lineage|americold/i;
@@ -44,7 +44,12 @@ export function rmpBaseFilter(row: RmpRow): boolean {
 
 export function rmpRelevant(row: RmpRow): boolean {
   const codes = rmpCodes(row);
-  if (codes.some((c) => RELEVANT.test(c))) return true;
+  const relevantCode = codes.some((c) => RELEVANT.test(c));
+  // Aqueous ammonia (≥20%) is almost always a stored chemical, not a refrigerant: keep it only
+  // for food / refrigerated-warehouse industries. Anhydrous ammonia is the refrigerant (R-717).
+  const anhydrous = /ammonia \(anhydrous\)/i.test(row.ChemicalsInLatest || "");
+  if (!anhydrous) return relevantCode && !/hydrochloric|sulfuric|nitric|phosphine|arsine|silane|chlorine/i.test(row.ChemicalsInLatest || "");
+  if (relevantCode) return true;
   return NAME_SIGNAL.test(row.Name || "") && !codes.every((c) => EXCLUDED.test(c));
 }
 
