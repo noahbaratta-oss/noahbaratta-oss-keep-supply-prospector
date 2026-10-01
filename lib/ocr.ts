@@ -69,11 +69,17 @@ export function ocrToFacilityLines(text: string): string[] {
   const out: Array<{ name: string; category?: string; address?: string }> = [];
   const last = () => out[out.length - 1];
   for (const raw of text.split(/\r?\n/)) {
-    const line = raw.replace(/[|•]+/g, "·").replace(/\s+/g, " ").trim();
+    // Google Maps separates fields with "·", which OCR usually reads as " - ", "•", "*" or "°".
+    const line = raw.replace(/[|•]+/g, "·").replace(/\s+[-–—*°·]\s+/g, " · ").replace(/\s+/g, " ").trim();
     if (line.length < 3 || /^[★☆*\s\d.,()]+$/.test(line)) continue;
     const parts = line.split("·").map((x) => x.trim()).filter(Boolean);
     const addr = parts.find((x) => /^\d{1,6}\s+[A-Za-z0-9]/.test(x));
     const category = parts.find((x) => CATEGORY_ONLY.test(x));
+    // One-line listing ("Name · Category · 123 Main St") when the previous facility already has an address.
+    if (addr && !SKIP_LINE.test(line) && parts[0] !== addr && !CATEGORY_ONLY.test(parts[0]) && (!last() || last().address)) {
+      out.push({ name: parts[0], category, address: addr });
+      continue;
+    }
     if (SKIP_LINE.test(line) || addr || (category && parts.length === 1)) {
       // Detail line for the facility above (rating, category, address, hours).
       const prev = last();
