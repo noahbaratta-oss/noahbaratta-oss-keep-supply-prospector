@@ -73,6 +73,13 @@ export const UNCLASSIFIED = "Industrial Facility (unclassified)";
 // generic pages that merely share a city or brand word (tourism, music, law firms…) are rejected.
 const STRONG_WEB_RE = /(cold storage|refrigerat|freezer|frozen|ammonia|cold chain|temperature[- ]controlled|meat (packing|packer|processing|company|plant)|beef (plant|packing|processing)|pork (plant|processing)|poultry|slaughter|packing (plant|house|company|shed)|packinghouse|processing (plant|facility|company)|food (processing|manufactur|plant|distribution)|foodservice distribution|dairy (plant|processing|farm|cooperative|co-op|products)|creamery|cheese (plant|company|factory|maker)|ice cream|brewery|brewing (company|co)|distillery|bottling|beverage (plant|manufactur|company)|seafood|fish processing|potato (processing|plant)|fruit (packing|storage)|refrigerated warehouse|distribution center|3pl|pharmaceutical|biotech|vaccine|industrial gas|chemical plant|rendering (plant|company)|ice (company|plant|manufactur))/i;
 
+// Consumer-facing pages (restaurants, retail, tourism) that mention food words but are not plants.
+const NON_FACILITY_RE = /\b(hibachi|buffet|restaurants?|sushi|steakhouse|grill|bistro|caf[eé]|pizz\w*|taqueria|diner|eatery|tap ?room|taproom|tasting room|brewpub|food truck|catering|menu|happy hour|reservations?|order online|plan your visit|visitor cent(er|re)|tours?|gift shop|recipes?|coupons?|groupon|yelp|tripadvisor|doordash|grubhub|ubereats)\b/i;
+
+export function isNonFacilityText(text: string): boolean {
+  return NON_FACILITY_RE.test(text);
+}
+
 export function isRelevantWebText(text: string): boolean {
   return STRONG_WEB_RE.test(text);
 }

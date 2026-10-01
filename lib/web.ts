@@ -4,7 +4,7 @@
 
 import type { Evidence, Prospect, ProviderLog } from "./types";
 import { fetchText, looksBlocked } from "./http";
-import { classifyFacility, facilityKey, finalize, isRelevantWebText, normName, refrigerationLabel, textSignals, UNCLASSIFIED } from "./classify";
+import { classifyFacility, facilityKey, finalize, isNonFacilityText, isRelevantWebText, normName, refrigerationLabel, textSignals, UNCLASSIFIED } from "./classify";
 import { detectCity, detectState, isWesternState } from "./geo";
 import { crossReferenceSeed } from "./merge";
 import { targetsMatching } from "./targeting";
@@ -243,7 +243,7 @@ export async function searchAll(queries: string[], providers: Record<string, boo
 // ---------------------------------------------------------------------------
 
 const SKIP_DOMAINS = /(wikipedia\.org|youtube\.com|reddit\.com|quora\.com|pinterest\.|amazon\.|ebay\.|indeed\.com|glassdoor\.|ziprecruiter\.|simplyhired\.|monster\.com|careerbuilder\.|salary\.com|merriam-webster|dictionary\.|britannica\.com|investopedia\.|tiktok\.com|instagram\.com|twitter\.com|x\.com\/|bing\.com|google\.com|yahoo\.com|duckduckgo\.com|mojeek\.com|startpage\.com|microsoft\.com|apple\.com|wiktionary|thesaurus|imdb\.com|tripadvisor\.|zillow\.|realtor\.com|loopnet\.com|crexi\.com|apartments\.com)/i;
-const LISTICLE = /^(top|best|the \d+|\d+ (best|top|largest|biggest)|list of|how |what |why |when |where |guide|find |search |jobs?\b|careers?\b|\w+ jobs)|near me|companies in\b|in your area|salary|salaries|job openings|\bjobs\b|for sale|for lease|definition|meaning/i;
+const LISTICLE = /^(top|best|the \d+|(\d+|three|four|five|six|seven|eight|nine|ten|twelve|fifteen|twenty) (best|top|largest|biggest|great|brands|ways|things|reasons)|list of|weekly ad|how |what |why |when |where |guide|find |search |jobs?\b|careers?\b|\w+ jobs)|near me|companies in\b|in your area|salary|salaries|job openings|\bjobs\b|for sale|for lease|definition|meaning/i;
 const GENERIC_NAMES = /^(home|welcome|about( us)?|contact( us)?|locations?|services|products|careers|news|facilities|our facilities|cold storage|refrigerated warehousing|industrial refrigeration|refrigeration|ammonia refrigeration|food processing|meat processing|brewery|distillery|dairy|index|untitled|pdf)$/i;
 const COMPANY_HINT = /\b(inc|llc|co|corp|company|foods?|farms?|dairy|dairies|creamery|meats?|packing|packers|cold storage|logistics|warehous\w*|brewing|brewery|distill\w*|beverages?|bottling|seafoods?|fisheries|refrigeration|mechanical|industries|group|enterprises|processing|produce|ice)\b/i;
 
@@ -255,7 +255,7 @@ function domainName(url: string): string {
 
 export function nameFromTitle(title: string, url: string): string {
   const parts = clean(title)
-    .split(/\s+[|–—-]\s+|\s*::\s*|\s*»\s*/)
+    .split(/\s+[|–—-]\s+|\s*::?\s+|\s*»\s*/)
     .map((s) => s.replace(/^(welcome to|home of|home -)\s+/i, "").replace(/\s*(official site|official website|homepage|home page)$/i, "").trim())
     .filter((s) => s.length > 2 && !/^(linkedin|facebook|yelp|mapquest|bbb|yellowpages|manta|dnb|zoominfo|bloomberg|crunchbase)$/i.test(s));
   const companyLike = parts.find((p) => COMPANY_HINT.test(p) && !GENERIC_NAMES.test(p) && p.length <= 80);
@@ -271,17 +271,21 @@ function domainMatchesName(domain: string, name: string): boolean {
   return label.length >= 4 && (compact.startsWith(label.slice(0, 8)) || (first.length >= 4 && label.startsWith(first)));
 }
 
-export function hitToRecord(hit: Hit, stateHint: string, targets: string[]): Prospect | null {
+export function hitToRecord(hit: Hit, _stateHint: string, targets: string[]): Prospect | null {
   if (SKIP_DOMAINS.test(hit.url)) return null;
   const title = clean(hit.title);
-  if (!title || LISTICLE.test(title)) return null;
+  if (!title || LISTICLE.test(title) || isNonFacilityText(title)) return null;
   const text = `${title}. ${hit.snippet}`;
   const sig = textSignals(text);
   const name = nameFromTitle(title, hit.url);
   if (!name || GENERIC_NAMES.test(name)) return null;
   const detected = detectState(`${text} ${hit.url}`, "");
   if (detected !== "Unknown" && !isWesternState(detected)) return null; // outside territory
-  const state = detected !== "Unknown" ? detected : stateHint;
+  // The source itself must place the facility in a Western state. Assigning the searched state to a
+  // result that never says where it is produced out-of-territory junk (e.g. a Durham, NC buffet filed
+  // under Avondale, AZ), so those results are dropped instead of guessed.
+  if (detected === "Unknown") return null;
+  const state = detected;
   if (!isWesternState(state)) return null;
   if (!isRelevantWebText(text)) return null;
   const type = classifyFacility(text);
@@ -290,7 +294,6 @@ export function hitToRecord(hit: Hit, stateHint: string, targets: string[]): Pro
   const domain = domainName(hit.url);
   const kind: Evidence["kind"] = /\.pdf($|\?)/i.test(hit.url) ? "document" : /\.(gov|us)$|\.gov\//i.test(domain) ? "government" : "web";
   const evidence: Evidence[] = [{ label: `${kind === "document" ? "Public document" : kind === "government" ? "Government web page" : "Web result"} (${hit.engine}): ${title.slice(0, 140)}`, detail: hit.snippet.slice(0, 400) || undefined, url: hit.url, source: "Web search", kind }];
-  if (detected === "Unknown") evidence.push({ label: `State assigned from search territory (${state}) — not stated in the source`, source: "Search context", kind: "inferred" });
   if (sig.ammoniaLb && sig.ammoniaLbExcerpt) evidence.push({ label: `Ammonia quantity stated: ${sig.ammoniaLb.toLocaleString()} lb`, detail: sig.ammoniaLbExcerpt, url: hit.url, source: "Web search", kind });
   const p: Prospect = {
     key: "",

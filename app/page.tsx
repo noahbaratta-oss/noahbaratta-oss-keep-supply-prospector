@@ -5,7 +5,7 @@ import type { DiscoverResponse, DiscoverTask, Prospect, ProviderLog } from "../l
 import { ALL_WESTERN, TERRITORY_OPTIONS, WESTERN_STATES } from "../lib/geo";
 import { buildPlan, type Depth } from "../lib/plan";
 import { SEED_VERSION, consolidateLifetime, mergeIntoLifetime, mergeProspect, westernSeedProspects } from "../lib/merge";
-import { finalize, isRelevantWebText } from "../lib/classify";
+import { finalize, isNonFacilityText, isRelevantWebText } from "../lib/classify";
 import { deleteRecord, getMeta, loadState, putRecords, setMeta } from "../lib/store";
 import { LS, download, fmt, parseFacilityList, readLs, selectedTargets, toCsv, writeLs } from "../lib/client-utils";
 import { OVERPASS_ENDPOINTS, osmElementsToRecords, osmQuery } from "../lib/osm";
@@ -242,6 +242,22 @@ export default function Home() {
           s.lastSearch = (s.lastSearch || []).filter((r) => !((r.providers || []).every((x) => x === "Web search") && !isRelevantWebText((r.evidence || []).map((e) => `${e.label} ${e.detail || ""}`).join(" "))));
           s.lastSearchNew = (s.lastSearchNew || []).filter((k) => lifetimeRef.current[k]);
           await Promise.all([setMeta("webFilterVersion", 2), setMeta("lastSearch", s.lastSearch), setMeta("lastSearchNew", s.lastSearchNew)]);
+        }
+        // One-time cleanup: web-only records whose location was assigned from the search territory
+        // (the source never named a state) or whose page is a restaurant / retail / tourism page.
+        if ((await getMeta<number>("webFilterVersion", 0)) < 3) {
+          const webOnly = (p: Prospect) => (p.providers || []).length > 0 && (p.providers || []).every((x) => /^Web /.test(x));
+          const junk = Object.values(lifetimeRef.current).filter((p) => !s.saved[p.key] && !p.inSeedList && webOnly(p) && (
+            (p.evidence || []).some((e) => /^State assigned from search territory/.test(e.label)) ||
+            (p.evidence || []).some((e) => e.source === "Web search" && isNonFacilityText(e.label.replace(/^[^:]*:\s*/, "")))));
+          for (const p of junk) { delete lifetimeRef.current[p.key]; await persistDelete("lifetime", p.key); }
+          if (junk.length) {
+            const gone = new Set(junk.map((p) => p.key));
+            s.lastSearch = (s.lastSearch || []).filter((r) => !gone.has(r.key) && !(r.evidence || []).some((e) => /^State assigned from search territory/.test(e.label)));
+            s.lastSearchNew = (s.lastSearchNew || []).filter((k) => !gone.has(k));
+            await Promise.all([setMeta("lastSearch", s.lastSearch), setMeta("lastSearchNew", s.lastSearchNew)]);
+          }
+          await setMeta("webFilterVersion", 3);
         }
         // One-time cleanup: RMP chemical-storage sites (aqueous ammonia at chemical distributors)
         // that an earlier filter let through.

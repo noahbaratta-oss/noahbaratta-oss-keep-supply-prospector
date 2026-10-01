@@ -63,21 +63,26 @@ export function upgradeLegacy(raw: Partial<Prospect> & Record<string, unknown>):
 export function mergeProspect(base: Prospect | undefined, incoming: Prospect): Prospect {
   if (!base) return finalize({ ...incoming, timesSeen: incoming.timesSeen || 1 });
   const lb = Math.max(base.ammoniaLb || 0, incoming.ammoniaLb || 0) || null;
+  // Registry / seed identities beat names parsed from web page titles.
+  const webOnly = (x: Prospect) => (x.providers || []).length > 0 && (x.providers || []).every((v) => /^Web /.test(v));
+  const swap = webOnly(base) && !webOnly(incoming) && Boolean(incoming.name);
+  const primary = swap ? incoming : base;
+  const other = swap ? base : incoming;
   const merged: Prospect = {
     ...base,
     // Keep the most specific known value for each descriptive field.
-    name: base.name || incoming.name,
-    facilityName: known(base.facilityName) || known(incoming.facilityName) || (incoming.name && normName(incoming.name) !== normName(base.name) ? incoming.name : undefined),
-    city: known(base.city) || incoming.city,
-    state: known(base.state) || incoming.state,
+    name: primary.name || other.name,
+    facilityName: known(primary.facilityName) || known(other.facilityName) || (other.name && normName(other.name) !== normName(primary.name) ? other.name : undefined),
+    city: known(primary.city) || other.city,
+    state: known(primary.state) || other.state,
     address: known(base.address) || known(incoming.address),
     zip: known(base.zip) || known(incoming.zip),
     phone: known(base.phone) || known(incoming.phone),
     website: known(base.website) || known(incoming.website),
     lat: base.lat ?? incoming.lat,
     lon: base.lon ?? incoming.lon,
-    industry: known(base.industry) && base.industry !== UNCLASSIFIED ? base.industry : incoming.industry,
-    facilityType: base.facilityType && base.facilityType !== UNCLASSIFIED ? base.facilityType : incoming.facilityType,
+    industry: known(primary.industry) && primary.industry !== UNCLASSIFIED ? primary.industry : other.industry,
+    facilityType: primary.facilityType && primary.facilityType !== UNCLASSIFIED ? primary.facilityType : other.facilityType,
     refrigeration: pickRefrigeration(base.refrigeration, incoming.refrigeration),
     ammonia: strongerAmmonia(base.ammonia, incoming.ammonia),
     ammoniaLb: lb,
