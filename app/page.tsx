@@ -2,10 +2,10 @@
 
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { DiscoverResponse, DiscoverTask, Prospect, ProviderLog } from "../lib/types";
-import { ALL_WESTERN, TERRITORY_OPTIONS } from "../lib/geo";
+import { ALL_WESTERN, TERRITORY_OPTIONS, WESTERN_STATES } from "../lib/geo";
 import { buildPlan, type Depth } from "../lib/plan";
 import { SEED_VERSION, consolidateLifetime, mergeIntoLifetime, mergeProspect, westernSeedProspects } from "../lib/merge";
-import { isRelevantWebText } from "../lib/classify";
+import { finalize, isRelevantWebText } from "../lib/classify";
 import { deleteRecord, getMeta, loadState, putRecords, setMeta } from "../lib/store";
 import { LS, download, fmt, parseFacilityList, readLs, selectedTargets, toCsv, writeLs } from "../lib/client-utils";
 import { OVERPASS_ENDPOINTS, osmElementsToRecords, osmQuery } from "../lib/osm";
@@ -91,6 +91,8 @@ export default function Home() {
 
   // Run state
   const [running, setRunning] = useState(false);
+  const runningRef = useRef(false);
+  useEffect(() => { runningRef.current = running; }, [running]);
   const [progress, setProgress] = useState("");
   const [error, setError] = useState("");
   const [health, setHealth] = useState<Health>({});
@@ -325,6 +327,81 @@ export default function Home() {
     })();
     return () => { if (timer) clearInterval(timer); };
   }, [ready, syncCloud]);
+
+  // One-time background cleanup (exact, not heuristic): ask the server which EPA RMP registrations the
+  // current filter accepts, then strip RMP evidence from Lifetime records whose registration is no longer
+  // accepted (aqueous ammonia stored at chemical warehouses, etc.). Also drops TRI/ECHO-only chemical
+  // wholesalers (NAICS 4246/4247). Saved, seed-list and researched records are kept (only cleaned).
+  useEffect(() => {
+    if (!ready) return;
+    void (async () => {
+      try {
+        if ((await getMeta<number>("rmpFilterVersion", 0)) >= 3) return;
+        const isRmpId = (id: string) => id.startsWith("RMP ");
+        const packs = await Promise.all(WESTERN_STATES.map(async (state) => {
+          const task: DiscoverTask = { id: `rmp-check:${state}`, kind: "rmp", state, label: state };
+          const r = await fetchWithTimeout("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "task", task, targets: [], ammoniaOnly: false, providers: {} }) }, 60_000);
+          const data = (await r.json()) as DiscoverResponse;
+          if (!r.ok || !data.diagnostics?.[0]?.ok) throw new Error(`RMP check failed for ${state}`);
+          return data.records;
+        }));
+        const accepted = new Set(packs.flat().flatMap((p) => (p.registryIds || []).filter(isRmpId)));
+        if (accepted.size < 100) return; // sanity: never prune against an incomplete answer
+        const lt = lifetimeRef.current;
+        const keepAnyway = (p: Prospect) => Boolean(savedRef.current[p.key] || p.inSeedList || p.lastResearched);
+        const chemWholesale = (p: Prospect) => (p.naics || []).length > 0 && (p.naics || []).every((c) => /^424[67]/.test(c)) &&
+          (p.providers || []).every((x) => x === "EPA TRI" || x === "EPA ECHO");
+        const changed: Prospect[] = [];
+        const removed: string[] = [];
+        for (const p of Object.values(lt)) {
+          const rmpIds = (p.registryIds || []).filter(isRmpId);
+          const staleRmp = rmpIds.length > 0 && !rmpIds.some((id) => accepted.has(id));
+          if (!staleRmp && !chemWholesale(p)) continue;
+          if (!staleRmp) { if (!keepAnyway(p)) removed.push(p.key); continue; }
+          const rmpLb = /epa-rmp-viewer/.test(p.ammoniaLbSource || "");
+          const evidence = (p.evidence || []).filter((e) => !/^EPA RMP:/.test(e.label));
+          const providers = (p.providers || []).filter((x) => x !== "EPA RMP");
+          if (!providers.length && !keepAnyway(p)) { removed.push(p.key); continue; }
+          const stillAmmonia = evidence.some((e) => /ammonia/i.test(`${e.label} ${e.detail || ""}`));
+          changed.push(finalize({
+            ...p,
+            evidence,
+            providers,
+            sourceUrls: (p.sourceUrls || []).filter((u) => !/epa-rmp-viewer/.test(u)),
+            registryIds: (p.registryIds || []).filter((id) => !isRmpId(id)),
+            ammoniaLb: rmpLb ? null : p.ammoniaLb,
+            ammoniaLbSource: rmpLb ? undefined : p.ammoniaLbSource,
+            ammonia: stillAmmonia ? p.ammonia : "Unknown",
+            refrigeration: /EPA RMP/.test(p.refrigeration || "") ? "Needs verification" : p.refrigeration,
+          }));
+        }
+        for (const p of changed) lt[p.key] = p;
+        if (changed.length) await persist("lifetime", changed);
+        for (const k of removed) { delete lt[k]; await persistDelete("lifetime", k); }
+        const savedChanged = changed.filter((p) => savedRef.current[p.key]).map((p) => ({ ...p, saved: true }));
+        if (savedChanged.length) {
+          await persist("saved", savedChanged);
+          setSaved((prev) => ({ ...prev, ...Object.fromEntries(savedChanged.map((p) => [p.key, p])) }));
+        }
+        // Last-sweep discovery records: drop rejected RMP / wholesale records, refresh the rest.
+        const gone = new Set(removed);
+        const dropRecord = (r: Prospect) => gone.has(r.key) ||
+          (/^rmp:/.test(r.recordId || "") && !accepted.has(`RMP ${(r.recordId || "").slice(4)}`)) ||
+          (/^tri:/.test(r.recordId || "") && (r.naics || []).length > 0 && (r.naics || []).every((c) => /^424[67]/.test(c)));
+        const prevLast = (await getMeta<Prospect[]>("lastSearch", [])) || [];
+        const nextLast = prevLast.filter((r) => !dropRecord(r));
+        const prevNew = (await getMeta<string[]>("lastSearchNew", [])) || [];
+        const nextNew = prevNew.filter((k) => lt[k]);
+        if (!runningRef.current && (nextLast.length !== prevLast.length || nextNew.length !== prevNew.length)) {
+          await Promise.all([setMeta("lastSearch", nextLast), setMeta("lastSearchNew", nextNew)]);
+          setLastSearch(nextLast);
+          setLastSearchNew(nextNew);
+        }
+        await setMeta("rmpFilterVersion", 3);
+        if (changed.length || removed.length) bumpLifetime();
+      } catch { /* network hiccup: try again on the next load */ }
+    })();
+  }, [ready, persist, persistDelete, bumpLifetime]);
 
   useEffect(() => { if (ready) writeLs(LS.territory, territory); }, [territory, ready]);
   useEffect(() => { if (ready) writeLs(LS.depth, depth); }, [depth, ready]);

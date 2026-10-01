@@ -110,7 +110,9 @@ export async function fsisProvider(states: string[], targets: string[]): Promise
 // EPA TRI — ammonia reporters
 // ---------------------------------------------------------------------------
 
-const TRI_RELEVANT_NAICS = ["311", "312", "3251", "3253", "3254", "4931", "424", "115", "3261", "3262", "722310"];
+// Wholesale: groceries (4244), farm products (4245), beverages (4248), drugs (4242). Chemical and
+// petroleum wholesalers (4246/4247: Univar, Brenntag…) report ammonia as stored product, not refrigerant.
+const TRI_RELEVANT_NAICS = ["311", "312", "3251", "3253", "3254", "4931", "4242", "4244", "4245", "4248", "115", "3261", "3262", "722310"];
 
 async function loadTriState(abbr: string): Promise<{ year: string; rows: Array<Record<string, string>>; url: string }> {
   return cached(`tri-${abbr}`, 24 * 3600_000, async () => {
@@ -150,7 +152,7 @@ export async function triProvider(state: string, targets: string[]): Promise<Res
       let type = facilityTypeFromNaics(naics);
       if (type.type === UNCLASSIFIED) type = classifyFacility(name);
       if (allowed && !allowed.has(type.type)) continue;
-      const food = naics.some((c) => /^(311|312|4931|424|115)/.test(c));
+      const food = naics.some((c) => /^(311|312|4931[23]|424[2458]|115)/.test(c));
       const frs = r["FRS ID"];
       const dfr = frs ? `https://echo.epa.gov/detailed-facility-report?fid=${frs}` : url;
       const parent = [r["STANDARD PARENT CO NAME"], r["PARENT CO NAME"]].find((x) => x && x !== "NA");

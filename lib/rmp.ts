@@ -98,7 +98,7 @@ export function rmpToProspect(row: RmpRow, targets: string[]): Prospect {
   let type = facilityTypeFromNaics(codes);
   if (type.type === UNCLASSIFIED) type = classifyFacility(row.Name || "");
   const { evidence, maxLb } = rmpEvidence(row);
-  const food = codes.some((c) => /^(311|312|4931|424|115)/.test(c));
+  const food = codes.some((c) => /^(311|312|4931[23]|424[2458]|115)/.test(c));
   const owner = [row.LatestCompany1, row.LatestOperator].find((x) => x && normName(x) !== normName(row.Name));
   return makeRecord({
     recordId: `rmp:${row.EPAFacilityID}`,
