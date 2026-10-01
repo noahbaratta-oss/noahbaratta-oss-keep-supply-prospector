@@ -22,9 +22,13 @@ function ammoniaText(p: Prospect) {
   return "Unknown";
 }
 
+function quantitySource(p: Prospect) {
+  return /epa-rmp-viewer|data-liberation/.test(p.ammoniaLbSource || "") ? "EPA RMP registration" : "public document";
+}
+
 function quantityText(p: Prospect) {
-  if (p.ammoniaLb && p.ammoniaLb >= 10000) return `${p.ammoniaLb.toLocaleString()} lb stated — meets 10,000-lb target (verify source)`;
-  if (p.ammoniaLb) return `${p.ammoniaLb.toLocaleString()} lb stated — below 10,000-lb target`;
+  if (p.ammoniaLb && p.ammoniaLb >= 10000) return `${p.ammoniaLb.toLocaleString()} lb (largest process, ${quantitySource(p)}) — meets the 10,000-lb target`;
+  if (p.ammoniaLb) return `${p.ammoniaLb.toLocaleString()} lb (${quantitySource(p)}) — below the 10,000-lb target`;
   return p.ammonia === "Confirmed" || p.ammonia === "Likely" ? "Not found in public sources" : "n/a (no ammonia evidence)";
 }
 
@@ -86,7 +90,7 @@ export default function Dossier({ prospect: p, saved, researching, notes, onClos
         </div>
 
         {p.ammoniaLb && p.ammoniaLb >= 10000 ? (
-          <div className="ammoniaBox">10,000+ lb ammonia stated in a public source{p.ammoniaLbSource ? <> — <a href={p.ammoniaLbSource} target="_blank" rel="noreferrer">{host(p.ammoniaLbSource)}</a></> : null}. Verify before quoting.</div>
+          <div className="ammoniaBox">10,000+ lb ammonia confirmed — {p.ammoniaLb.toLocaleString()} lb in the largest process ({quantitySource(p)}){p.ammoniaLbSource ? <> · <a href={p.ammoniaLbSource} target="_blank" rel="noreferrer">view record</a></> : null}.</div>
         ) : null}
 
         <p className="reason"><strong>Why it scored:</strong> {p.reason || "—"}</p>

@@ -13,6 +13,7 @@ import { researchQueries } from "./plan";
 import { clean, searchAll, type Hit } from "./web";
 import { echoQuery, echoToProspect, fsisProvider, triAmmonia } from "./providers";
 import { mergeEvidence, mergeProspect } from "./merge";
+import { rmpEvidence, rmpRowsForState, rmpToProspect, type RmpRow } from "./rmp";
 
 export type ResearchResult = {
   prospect: Prospect;
@@ -100,7 +101,21 @@ export async function researchProspect(input: Prospect, providers: Record<string
     return matches;
   })();
 
-  const [web, echoMatches, triMatches, fsisMatches] = await Promise.all([webJob, echoJob, triJob, fsisJob]);
+  const rmpJob = (async (): Promise<RmpRow[]> => {
+    if (!isWesternState(state) || providers.rmp === false) return [];
+    const started = Date.now();
+    try {
+      const { rows } = await rmpRowsForState(state);
+      const matches = rows.filter((r) => mentions(`${r.Name} ${r.LatestCompany1 || ""} ${r.LatestOperator || ""}`, p.name));
+      logs.push({ provider: "EPA RMP (by name)", ok: true, status: matches.length ? "ok" : "empty", count: matches.length, ms: Date.now() - started });
+      return matches;
+    } catch (e) {
+      logs.push({ provider: "EPA RMP (by name)", ok: false, status: "error", count: 0, ms: Date.now() - started, detail: e instanceof Error ? e.message : "failed" });
+      return [];
+    }
+  })();
+
+  const [web, echoMatches, triMatches, fsisMatches, rmpMatches] = await Promise.all([webJob, echoJob, triJob, fsisJob, rmpJob]);
   logs.push(...web.logs);
 
   // Web hits that actually mention the company.
@@ -160,6 +175,19 @@ export async function researchProspect(input: Prospect, providers: Record<string
   logs.push({ provider: "Page scan", ok: true, status: pagesRead ? "ok" : "empty", count: pagesRead, ms: Date.now() - started, detail: `${pagesRead}/${toFetch.length} pages readable` });
 
   // Structured matches → evidence on this record, and related facility records.
+  for (const r of rmpMatches) {
+    const sameCity = (r.City || "").toLowerCase() === (p.city || "").toLowerCase();
+    if (sameCity || (p.city === "Unknown" && rmpMatches.length === 1)) {
+      const { evidence, maxLb } = rmpEvidence(r);
+      newEvidence.push(evidence);
+      ammonia = "Confirmed";
+      if (maxLb && (!ammoniaLb || maxLb > ammoniaLb)) { ammoniaLb = maxLb; ammoniaLbSource = evidence.url; }
+      p.registryIds = [...new Set([...(p.registryIds || []), `RMP ${r.EPAFacilityID}`])];
+      p.providers = [...new Set([...p.providers, "EPA RMP"])];
+    } else {
+      related.push({ ...rmpToProspect(r, []), inSeedList: p.inSeedList, buyerType: p.buyerType, salesApproach: p.salesApproach });
+    }
+  }
   for (const t of triMatches) {
     const sameCity = (t["CITY"] || "").toLowerCase() === (p.city || "").toLowerCase();
     const frs = t["FRS ID"];
@@ -215,7 +243,7 @@ export async function researchProspect(input: Prospect, providers: Record<string
 
   const lines: string[] = [
     `LIVE PUBLIC RESEARCH — ${p.name}${p.city && p.city !== "Unknown" ? `, ${p.city}` : ""}, ${state}`,
-    `${hits.length} web sources mention the company · ${pagesRead} pages scanned · ${triMatches.length} TRI ammonia matches · ${echoMatches.length} EPA ECHO matches · ${fsisMatches.length} FSIS matches`,
+    `${hits.length} web sources mention the company · ${pagesRead} pages scanned · ${rmpMatches.length} EPA RMP ammonia registrations · ${triMatches.length} TRI ammonia matches · ${echoMatches.length} EPA ECHO matches · ${fsisMatches.length} FSIS matches`,
     `Ammonia: ${enriched.ammonia}${enriched.ammoniaLb ? ` · ${enriched.ammoniaLb.toLocaleString()} lb stated (see source)` : ""} · CO₂: ${enriched.co2 ? "signal found" : "not found"} · OEM mentions: ${[...brands].join(", ") || "none found"}`,
     related.length ? `Other facilities found: ${related.map((r) => `${r.name} — ${r.city}`).slice(0, 12).join("; ")}` : "No other facilities found in this pass.",
     "The 10,000-lb threshold applies only when ammonia is present and a public document states the quantity.",

@@ -1,5 +1,5 @@
 // Public web search adapters. Every engine is independent: a blocked or failing engine is
-// logged and skipped, never fatal. Keyed engines (Brave, Google Programmable Search) are
+// logged and skipped, never fatal. Keyed engines (Brave Search API) are
 // optional and only run when their environment variables are configured.
 
 import type { Evidence, Prospect, ProviderLog } from "./types";
@@ -7,7 +7,7 @@ import { fetchText, looksBlocked } from "./http";
 import { classifyFacility, facilityKey, finalize, isRelevantWebText, normName, refrigerationLabel, textSignals, UNCLASSIFIED } from "./classify";
 import { detectCity, detectState, isWesternState } from "./geo";
 import { crossReferenceSeed } from "./merge";
-import { targetsMatching } from "./providers";
+import { targetsMatching } from "./targeting";
 
 export type Hit = { title: string; url: string; snippet: string; engine: string };
 
@@ -19,15 +19,13 @@ export const ENGINES: EngineMeta[] = [
   { id: "yahoo", label: "Yahoo", defaultOn: true },
   { id: "mojeek", label: "Mojeek", defaultOn: true },
   { id: "startpage", label: "Startpage", defaultOn: true },
-  { id: "google", label: "Google (HTML)", defaultOn: false, note: "Google HTML results require JavaScript; use Google Programmable Search key instead" },
+  { id: "google", label: "Google (HTML)", defaultOn: false, note: "Google HTML results require JavaScript" },
   { id: "marginalia", label: "Marginalia", defaultOn: false },
-  { id: "brave", label: "Brave Search API", defaultOn: true, keyed: true, note: "Optional: BRAVE_SEARCH_API_KEY (free tier)" },
-  { id: "googlecse", label: "Google Programmable Search", defaultOn: true, keyed: true, note: "Optional: GOOGLE_CSE_KEY + GOOGLE_CSE_CX (free daily quota)" },
+  { id: "brave", label: "Brave Search API", defaultOn: true, keyed: true, note: "Optional: BRAVE_SEARCH_API_KEY ($5/month credit ≈ 1,000 searches)" },
 ];
 
 export function keyedConfigured(id: string): boolean {
   if (id === "brave") return Boolean(process.env.BRAVE_SEARCH_API_KEY);
-  if (id === "googlecse") return Boolean(process.env.GOOGLE_CSE_KEY && process.env.GOOGLE_CSE_CX);
   return true;
 }
 
@@ -205,19 +203,7 @@ async function brave(q: string): Promise<EngineOut> {
   } catch { return done([], "error", "bad JSON"); }
 }
 
-async function googleCse(q: string): Promise<EngineOut> {
-  const key = process.env.GOOGLE_CSE_KEY;
-  const cx = process.env.GOOGLE_CSE_CX;
-  if (!key || !cx) return done([], "disabled", "GOOGLE_CSE_KEY / GOOGLE_CSE_CX not set");
-  const r = await fetchText(`https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&num=10&q=${encodeURIComponent(q)}`, { timeout: 6500 });
-  if (!r.ok) return done([], r.status === 429 ? "blocked" : "error", `HTTP ${r.status}`);
-  try {
-    const j = JSON.parse(r.text);
-    return done((j.items || []).map((x: { link: string; title: string; snippet: string }) => ({ title: x.title, url: x.link, snippet: x.snippet || "", engine: "Google CSE" })), "ok");
-  } catch { return done([], "error", "bad JSON"); }
-}
-
-const ENGINE_FNS: Record<string, (q: string) => Promise<EngineOut>> = { bing, ddg, yahoo, mojeek, startpage, google, marginalia, brave, googlecse: googleCse };
+const ENGINE_FNS: Record<string, (q: string) => Promise<EngineOut>> = { bing, ddg, yahoo, mojeek, startpage, google, marginalia, brave };
 
 export function enabledEngines(providers: Record<string, boolean>): string[] {
   return ENGINES.filter((e) => (providers[e.id] ?? e.defaultOn) && (!e.keyed || keyedConfigured(e.id))).map((e) => e.id);

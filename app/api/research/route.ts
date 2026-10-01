@@ -4,6 +4,8 @@ import { echoProvider, fsisProvider, osmProvider, triProvider } from "../../../l
 import { ENGINES, keyedConfigured, searchAll, webTask } from "../../../lib/web";
 import { researchProspect } from "../../../lib/research";
 import { isWesternState } from "../../../lib/geo";
+import { rmpProvider } from "../../../lib/rmp";
+import { extractFacilitiesFromImage, visionConfigured } from "../../../lib/vision";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -29,6 +31,9 @@ export async function POST(req: Request) {
       let out: DiscoverResponse;
       if (task.kind === "fsis") {
         const r = await fsisProvider(task.states.filter(isWesternState), cleanTargets);
+        out = { records: r.records, rawHits: r.rawHits, diagnostics: [r.log] };
+      } else if (task.kind === "rmp") {
+        const r = await rmpProvider(task.state, cleanTargets);
         out = { records: r.records, rawHits: r.rawHits, diagnostics: [r.log] };
       } else if (task.kind === "tri") {
         const r = await triProvider(task.state, cleanTargets);
@@ -60,6 +65,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ mode: "research", ...result });
     }
 
+    if (mode === "vision") {
+      const image = String(body.image || "");
+      const mediaType = String(body.mediaType || "image/jpeg");
+      if (!visionConfigured()) return NextResponse.json({ error: "Screenshot reading with AI is not configured (ANTHROPIC_API_KEY)." }, { status: 501 });
+      if (!image || image.length > 4_000_000) return NextResponse.json({ error: "Image missing or too large." }, { status: 400 });
+      const result = await extractFacilitiesFromImage(image, mediaType);
+      return NextResponse.json(result);
+    }
+
     if (mode === "discover" || mode === "categoryDiscover") {
       return NextResponse.json({ error: "The Prospecting Engine was updated. Please reload the page." }, { status: 409 });
     }
@@ -75,11 +89,13 @@ export async function GET(req: Request) {
   if (!url.searchParams.get("probe")) {
     return NextResponse.json({
       engines: ENGINES.map((e) => ({ ...e, configured: keyedConfigured(e.id) })),
-      structured: ["USDA FSIS", "EPA TRI", "EPA ECHO", "OpenStreetMap"],
+      structured: ["EPA RMP", "USDA FSIS", "EPA TRI", "EPA ECHO", "OpenStreetMap"],
+      visionConfigured: visionConfigured(),
     });
   }
   const started = Date.now();
-  const [fsis, tri, echo, osm, web] = await Promise.all([
+  const [rmp, fsis, tri, echo, osm, web] = await Promise.all([
+    rmpProvider("Idaho", []),
     fsisProvider(["Idaho"], ["Beef processing plants"]),
     triProvider("Idaho", []),
     echoProvider("Idaho", ["493120", "311511"], []),
@@ -88,8 +104,8 @@ export async function GET(req: Request) {
   ]);
   return NextResponse.json({
     ms: Date.now() - started,
-    structured: [fsis.log, tri.log, echo.log, ...(osm ? [osm.log] : [])],
+    structured: [rmp.log, fsis.log, tri.log, echo.log, ...(osm ? [osm.log] : [])],
     engines: web.logs,
-    sample: [...fsis.records.slice(0, 2), ...tri.records.slice(0, 2), ...echo.records.slice(0, 2)].map((p) => `${p.name} — ${p.city}, ${p.state} (${p.providers.join("+")}, score ${p.score})`),
+    sample: [...rmp.records.slice(0, 2), ...fsis.records.slice(0, 2), ...tri.records.slice(0, 2), ...echo.records.slice(0, 2)].map((p) => `${p.name} — ${p.city}, ${p.state} (${p.providers.join("+")}, score ${p.score})`),
   });
 }

@@ -8,6 +8,9 @@ import { SEED_VERSION, consolidateLifetime, mergeIntoLifetime, mergeProspect, we
 import { isRelevantWebText } from "../lib/classify";
 import { deleteRecord, getMeta, loadState, putRecords, setMeta } from "../lib/store";
 import { LS, download, fmt, parseFacilityList, readLs, selectedTargets, toCsv, writeLs } from "../lib/client-utils";
+import { OVERPASS_ENDPOINTS, osmElementsToRecords, osmQuery } from "../lib/osm";
+import { asProspect, cloudPull, cloudPush, cloudStatus, rememberPasscode, storedPasscode, type CloudStatus } from "../lib/cloud";
+import { imageToJpeg, ocrImage, ocrToFacilityLines } from "../lib/ocr";
 import Dossier from "./Dossier";
 
 const PAGE_SIZE = 100;
@@ -17,6 +20,7 @@ type SortKey = "score" | "newest" | "name" | "location" | "sources";
 type Health = Record<string, ProviderLog & { calls: number; failures: number }>;
 
 const PROVIDER_TOGGLES: Array<{ id: string; label: string; group: "Public records" | "Web search" | "Optional API"; defaultOn: boolean; note?: string }> = [
+  { id: "rmp", label: "EPA RMP ammonia registrations (10,000+ lb)", group: "Public records", defaultOn: true },
   { id: "fsis", label: "USDA FSIS inspected establishments", group: "Public records", defaultOn: true },
   { id: "tri", label: "EPA TRI ammonia reporters", group: "Public records", defaultOn: true },
   { id: "echo", label: "EPA ECHO regulated facilities", group: "Public records", defaultOn: true },
@@ -29,11 +33,10 @@ const PROVIDER_TOGGLES: Array<{ id: string; label: string; group: "Public record
   { id: "startpage", label: "Startpage", group: "Web search", defaultOn: true },
   { id: "google", label: "Google (HTML)", group: "Web search", defaultOn: false, note: "Google HTML results need JavaScript" },
   { id: "marginalia", label: "Marginalia", group: "Web search", defaultOn: false },
-  { id: "brave", label: "Brave Search API", group: "Optional API", defaultOn: true, note: "needs BRAVE_SEARCH_API_KEY in Vercel" },
-  { id: "googlecse", label: "Google Programmable Search", group: "Optional API", defaultOn: true, note: "needs GOOGLE_CSE_KEY + GOOGLE_CSE_CX" },
+  { id: "brave", label: "Brave Search API", group: "Optional API", defaultOn: true, note: "needs BRAVE_SEARCH_API_KEY in Vercel ($5/month credit)" },
 ];
 
-const PROVIDER_LOG_NAMES: Record<string, string> = { fsis: "USDA FSIS", tri: "EPA TRI", echo: "EPA ECHO", osm: "OpenStreetMap", bing: "Bing", ddg: "DuckDuckGo", yahoo: "Yahoo", mojeek: "Mojeek", startpage: "Startpage", google: "Google (HTML)", marginalia: "Marginalia", brave: "Brave Search API", googlecse: "Google Programmable Search" };
+const PROVIDER_LOG_NAMES: Record<string, string> = { rmp: "EPA RMP", fsis: "USDA FSIS", tri: "EPA TRI", echo: "EPA ECHO", osm: "OpenStreetMap", bing: "Bing", ddg: "DuckDuckGo", yahoo: "Yahoo", mojeek: "Mojeek", startpage: "Startpage", google: "Google (HTML)", marginalia: "Marginalia", brave: "Brave Search API" };
 
 function defaultProviders(): Record<string, boolean> {
   return Object.fromEntries(PROVIDER_TOGGLES.map((p) => [p.id, p.defaultOn]));
@@ -88,8 +91,109 @@ export default function Home() {
   // Data tools
   const [showTools, setShowTools] = useState(false);
   const [pasteText, setPasteText] = useState("");
+  const [imageStatus, setImageStatus] = useState("");
+  const [visionReady, setVisionReady] = useState(false);
+
+  // Cloud sync (active once a database + APP_PASSCODE are configured in Vercel)
+  const [cloud, setCloud] = useState<{ status: CloudStatus | null; connected: boolean; syncing: boolean; lastSync: number | null; error: string }>({ status: null, connected: false, syncing: false, lastSync: null, error: "" });
+  const [passInput, setPassInput] = useState("");
+  const cloudRef = useRef<{ passcode: string; dirty: Map<string, { store: string; key: string; data: unknown }>; deletes: Map<string, { store: string; key: string }>; timer: ReturnType<typeof setTimeout> | null }>({ passcode: "", dirty: new Map(), deletes: new Map(), timer: null });
+
+  const flushCloud = useCallback(async () => {
+    const c = cloudRef.current;
+    if (c.timer) { clearTimeout(c.timer); c.timer = null; }
+    if (!c.passcode || (!c.dirty.size && !c.deletes.size)) return;
+    const upserts = [...c.dirty.values()];
+    const deletes = [...c.deletes.values()];
+    c.dirty = new Map();
+    c.deletes = new Map();
+    try {
+      await cloudPush(c.passcode, upserts, deletes);
+      setCloud((x) => ({ ...x, lastSync: Date.now(), error: "" }));
+    } catch (e) {
+      for (const u of upserts) if (!c.dirty.has(`${u.store}|${u.key}`)) c.dirty.set(`${u.store}|${u.key}`, u);
+      for (const d of deletes) c.deletes.set(`${d.store}|${d.key}`, d);
+      setCloud((x) => ({ ...x, error: e instanceof Error ? e.message : "Cloud sync failed" }));
+    }
+  }, []);
+
+  const queueCloud = useCallback((items: Array<{ store: string; key: string; data?: unknown; deleted?: boolean }>) => {
+    const c = cloudRef.current;
+    if (!c.passcode) return;
+    for (const it of items) {
+      const id = `${it.store}|${it.key}`;
+      if (it.deleted) { c.dirty.delete(id); c.deletes.set(id, { store: it.store, key: it.key }); }
+      else { c.deletes.delete(id); c.dirty.set(id, { store: it.store, key: it.key, data: it.data }); }
+    }
+    if (!c.timer) c.timer = setTimeout(() => { void flushCloud(); }, 4000);
+  }, [flushCloud]);
+
+  // IndexedDB write + cloud queue in one place.
+  const persist = useCallback(async (store: "lifetime" | "saved", records: Prospect[]) => {
+    await putRecords(store, records);
+    queueCloud(records.map((r) => ({ store, key: r.key, data: r })));
+  }, [queueCloud]);
+  const persistDelete = useCallback(async (store: "lifetime" | "saved", key: string) => {
+    await deleteRecord(store, key);
+    queueCloud([{ store, key, deleted: true }]);
+  }, [queueCloud]);
 
   const bumpLifetime = useCallback(() => setLifetimeTick((t) => t + 1), []);
+  const savedRef = useRef<Record<string, Prospect>>({});
+  useEffect(() => { savedRef.current = saved; }, [saved]);
+
+  // Pull the cloud copy, merge it into this browser, then push anything the cloud is missing.
+  const syncCloud = useCallback(async (passcode: string) => {
+    setCloud((x) => ({ ...x, syncing: true, error: "" }));
+    try {
+      const since = await getMeta<string>("cloudSince", "1970-01-01T00:00:00Z");
+      const firstSync = since.startsWith("1970");
+      const { records, latest } = await cloudPull(passcode, since);
+      const lt = lifetimeRef.current;
+      const changedLocal: Prospect[] = [];
+      const pushBack: Prospect[] = [];
+      const nextSaved = { ...savedRef.current };
+      let savedChanged = false;
+      for (const rec of records) {
+        if (rec.store === "lifetime") {
+          if (rec.deleted) { if (lt[rec.key]) { delete lt[rec.key]; await deleteRecord("lifetime", rec.key); } continue; }
+          const remote = asProspect(rec.data);
+          if (!remote) continue;
+          const local = lt[rec.key];
+          const merged = local ? mergeProspect(local, remote) : remote;
+          merged.key = rec.key;
+          lt[rec.key] = merged;
+          changedLocal.push(merged);
+          if (local) pushBack.push(merged);
+        } else if (rec.store === "saved") {
+          if (rec.deleted) {
+            if (nextSaved[rec.key]) { delete nextSaved[rec.key]; savedChanged = true; await deleteRecord("saved", rec.key); }
+          } else {
+            const sp = asProspect(rec.data);
+            if (sp) { nextSaved[rec.key] = { ...sp, saved: true }; savedChanged = true; await putRecords("saved", [nextSaved[rec.key]]); }
+          }
+        } else if (rec.store === "meta" && rec.key === "memory" && rec.data && typeof rec.data === "object") {
+          memoryRef.current = { ...(rec.data as Record<string, number>), ...memoryRef.current };
+        }
+      }
+      if (changedLocal.length) await putRecords("lifetime", changedLocal);
+      if (savedChanged) setSaved(nextSaved);
+      cloudRef.current.passcode = passcode;
+      const toPush = firstSync ? Object.values(lt) : pushBack;
+      queueCloud(toPush.map((r) => ({ store: "lifetime", key: r.key, data: r })));
+      if (firstSync) queueCloud(Object.values(nextSaved).map((r) => ({ store: "saved", key: r.key, data: r })));
+      queueCloud([{ store: "meta", key: "memory", data: memoryRef.current }]);
+      await flushCloud();
+      await Promise.all([setMeta("cloudSince", latest), setMeta("memory", memoryRef.current)]);
+      rememberPasscode(passcode);
+      bumpLifetime();
+      setCloud((x) => ({ ...x, connected: true, syncing: false, lastSync: Date.now(), error: "" }));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Cloud sync failed";
+      if (/passcode/i.test(msg)) { rememberPasscode(""); cloudRef.current.passcode = ""; }
+      setCloud((x) => ({ ...x, syncing: false, connected: /passcode/i.test(msg) ? false : x.connected, error: msg }));
+    }
+  }, [bumpLifetime, flushCloud, queueCloud]);
 
   // ---------------------------------------------------------------------------
   // Load persisted state + seed list
@@ -108,7 +212,7 @@ export default function Home() {
         lifetimeRef.current = s.lifetime;
         if (s.seedVersion < SEED_VERSION) {
           const { changed } = mergeIntoLifetime(lifetimeRef.current, westernSeedProspects());
-          await putRecords("lifetime", changed);
+          await persist("lifetime", changed);
           await setMeta("seedVersion", SEED_VERSION);
         }
         // One-time cleanup: drop web-only records that fail the stricter relevance check
@@ -118,7 +222,7 @@ export default function Home() {
             !s.saved[p.key] && !p.inSeedList && !p.lastResearched &&
             (p.providers || []).every((x) => x === "Web search") &&
             !isRelevantWebText((p.evidence || []).map((e) => `${e.label} ${e.detail || ""}`).join(" ")));
-          for (const p of junk) { delete lifetimeRef.current[p.key]; await deleteRecord("lifetime", p.key); }
+          for (const p of junk) { delete lifetimeRef.current[p.key]; await persistDelete("lifetime", p.key); }
           s.lastSearch = (s.lastSearch || []).filter((r) => !((r.providers || []).every((x) => x === "Web search") && !isRelevantWebText((r.evidence || []).map((e) => `${e.label} ${e.detail || ""}`).join(" "))));
           s.lastSearchNew = (s.lastSearchNew || []).filter((k) => lifetimeRef.current[k]);
           await Promise.all([setMeta("webFilterVersion", 2), setMeta("lastSearch", s.lastSearch), setMeta("lastSearchNew", s.lastSearchNew)]);
@@ -128,14 +232,14 @@ export default function Home() {
           const { lifetime: next, remap, removed } = consolidateLifetime(lifetimeRef.current);
           if (removed.length) {
             lifetimeRef.current = next;
-            await putRecords("lifetime", Object.values(next));
-            for (const k of removed) await deleteRecord("lifetime", k);
+            await persist("lifetime", Object.values(next));
+            for (const k of removed) await persistDelete("lifetime", k);
             for (const [from, to] of Object.entries(remap)) {
               if (s.saved[from]) {
                 s.saved[to] = { ...(next[to] || s.saved[from]), saved: true };
                 delete s.saved[from];
-                await deleteRecord("saved", from);
-                await putRecords("saved", [s.saved[to]]);
+                await persistDelete("saved", from);
+                await persist("saved", [s.saved[to]]);
               }
               if (s.memory && s.memory[from] && !s.memory[to]) s.memory[to] = s.memory[from];
             }
@@ -174,6 +278,23 @@ export default function Home() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready]);
+
+  // Cloud sync + optional AI screenshot reading: detect what the server has configured.
+  useEffect(() => {
+    if (!ready) return;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    void (async () => {
+      const status = await cloudStatus();
+      setCloud((x) => ({ ...x, status }));
+      const pass = storedPasscode();
+      if (status.configured && pass) {
+        await syncCloud(pass);
+        timer = setInterval(() => { if (cloudRef.current.passcode) void syncCloud(cloudRef.current.passcode); }, 10 * 60_000);
+      }
+      try { const cfg = await fetch("/api/research").then((r) => r.json()); setVisionReady(Boolean(cfg.visionConfigured)); } catch { /* optional */ }
+    })();
+    return () => { if (timer) clearInterval(timer); };
+  }, [ready, syncCloud]);
 
   useEffect(() => { if (ready) writeLs(LS.territory, territory); }, [territory, ready]);
   useEffect(() => { if (ready) writeLs(LS.depth, depth); }, [depth, ready]);
@@ -216,7 +337,7 @@ export default function Home() {
       (!q || `${p.name} ${p.facilityName || ""} ${p.city} ${p.state} ${p.industry} ${p.facilityType} ${p.refrigeration} ${(p.targetCategories || []).join(" ")} ${p.address || ""}`.toLowerCase().includes(q)),
     );
     const cmp: Record<SortKey, (a: Prospect, b: Prospect) => number> = {
-      score: (a, b) => b.score - a.score || a.name.localeCompare(b.name),
+      score: (a, b) => b.score - a.score || (b.ammoniaLb || 0) - (a.ammoniaLb || 0) || (b.evidenceSources || 0) - (a.evidenceSources || 0) || a.name.localeCompare(b.name),
       newest: (a, b) => (b.firstSeen || 0) - (a.firstSeen || 0) || b.score - a.score,
       name: (a, b) => a.name.localeCompare(b.name),
       location: (a, b) => a.state.localeCompare(b.state) || a.city.localeCompare(b.city) || b.score - a.score,
@@ -249,9 +370,9 @@ export default function Home() {
     const base = lt[key] || p;
     lt[key] = { ...base, saved: !isSaved };
     bumpLifetime();
-    await putRecords("lifetime", [lt[key]]);
-    if (isSaved) await deleteRecord("saved", key);
-    else await putRecords("saved", [next[key]]);
+    await persist("lifetime", [lt[key]]);
+    if (isSaved) await persistDelete("saved", key);
+    else await persist("saved", [next[key]]);
   }
 
   // ---------------------------------------------------------------------------
@@ -273,8 +394,8 @@ export default function Home() {
       const { changed, newKeys } = mergeIntoLifetime(lt, related);
       const now = Date.now();
       for (const k of newKeys) memoryRef.current[k] = memoryRef.current[k] ?? now;
-      await putRecords("lifetime", [enriched, ...changed]);
-      if (saved[p.key]) await putRecords("saved", [{ ...enriched, saved: true }]);
+      await persist("lifetime", [enriched, ...changed]);
+      if (saved[p.key]) await persist("saved", [{ ...enriched, saved: true }]);
       setResearchNotes((m) => ({ ...m, [p.key]: { dossier: String(d.dossier || ""), related } }));
       if (newKeys.length) await setMeta("memory", memoryRef.current);
       bumpLifetime();
@@ -353,7 +474,7 @@ export default function Home() {
       const now = Date.now();
       for (const k of nk) { newKeys.add(k); memoryRef.current[k] = memoryRef.current[k] ?? now; }
       for (const r of fresh) memoryRef.current[r.key] = memoryRef.current[r.key] ?? now;
-      await putRecords("lifetime", changed);
+      await persist("lifetime", changed);
       if (task.kind === "web") { webDone++; webHits += res.rawHits || 0; }
       setLastSearch(records.slice());
       setLastSearchNew([...newKeys]);
@@ -376,15 +497,23 @@ export default function Home() {
         setProgress(`Pack ${done + 1}/${plan.length} · ${task.label} · ${fmt(records.length)} discovery records · ${fmt(newKeys.size)} new facilities`);
         let failed = false;
         try {
-          const r = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "task", task, targets, ammoniaOnly, providers }) });
-          const d = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
-          if (!r.ok) {
-            failed = true;
-            record([{ provider: task.label, ok: false, status: "error", count: 0, ms: 0, detail: d.error || `HTTP ${r.status}` }]);
+          // OpenStreetMap runs from this browser (Overpass throttles shared cloud servers);
+          // the server is only used if the browser request fails.
+          const local = task.kind === "osm" ? await runOsmInBrowser(task.state, targets) : null;
+          if (local) {
+            failed = local.diagnostics.every((x) => !x.ok);
+            await handle(task, local);
           } else {
-            const res = d as DiscoverResponse;
-            failed = (res.diagnostics || []).length > 0 && (res.diagnostics || []).every((x) => !x.ok);
-            await handle(task, res);
+            const r = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "task", task, targets, ammoniaOnly, providers }) });
+            const d = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+            if (!r.ok) {
+              failed = true;
+              record([{ provider: task.label, ok: false, status: "error", count: 0, ms: 0, detail: d.error || `HTTP ${r.status}` }]);
+            } else {
+              const res = d as DiscoverResponse;
+              failed = (res.diagnostics || []).length > 0 && (res.diagnostics || []).every((x) => !x.ok);
+              await handle(task, res);
+            }
           }
         } catch (e) {
           failed = true;
@@ -402,7 +531,7 @@ export default function Home() {
           // the server — skip the remaining web packs instead of waiting on them.
           if (task.kind === "web" && webDone >= 10 && webHits === 0 && !skipKinds.has("web")) {
             skipKinds.add("web");
-            record([{ provider: "Web discovery", ok: false, status: "skipped", count: 0, ms: 0, detail: "Search engines returned no results to the server; remaining web packs skipped. Add a Brave or Google API key for reliable web search." }]);
+            record([{ provider: "Web discovery", ok: false, status: "skipped", count: 0, ms: 0, detail: "Search engines returned no results to the server; remaining web packs skipped. Add a Brave Search API key in Vercel for reliable web search." }]);
           }
         }
       }
@@ -417,6 +546,8 @@ export default function Home() {
       setMeta("lastSearch", records), setMeta("lastSearchNew", [...newKeys]), setMeta("lastSearchMeta", meta),
       setMeta("memory", memoryRef.current), setMeta("sweep", sweepRef.current),
     ]);
+    queueCloud([{ store: "meta", key: "memory", data: memoryRef.current }]);
+    void flushCloud();
     const stopped = abortRef.current.stop;
     const summary = `${fmt(records.length)} discovery records (${fmt(new Set(records.map((r) => r.key)).size)} unique facilities, ${fmt(newKeys.size)} new) from ${fmt(rawHits)} raw source rows`;
     setProgress(`${stopped ? "Stopped" : "Complete"} — ${summary}. Lifetime: ${fmt(Object.keys(lt).length)}.`);
@@ -432,6 +563,61 @@ export default function Home() {
       setProgress(`Complete — ${summary}. Secondary research run on ${picks.length} top new prospects. Lifetime: ${fmt(Object.keys(lt).length)}.`);
     }
     setRunning(false);
+  }
+
+  async function runOsmInBrowser(state: string, targets: string[]): Promise<DiscoverResponse | null> {
+    const query = osmQuery(state, targets);
+    if (!query) return { records: [], rawHits: 0, diagnostics: [{ provider: "OpenStreetMap", ok: true, status: "skipped", count: 0, ms: 0, detail: "No map tags for selected targets" }] };
+    const started = Date.now();
+    for (const endpoint of OVERPASS_ENDPOINTS) {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 30000);
+      try {
+        const r = await fetch(endpoint, { method: "POST", body: `data=${encodeURIComponent(query)}`, headers: { "Content-Type": "application/x-www-form-urlencoded" }, signal: ctl.signal });
+        if (!r.ok) continue;
+        const j = await r.json();
+        const els = j.elements || [];
+        const recs = osmElementsToRecords(els, state, targets);
+        return { records: recs, rawHits: els.length, diagnostics: [{ provider: "OpenStreetMap", ok: true, status: recs.length ? "ok" : "empty", count: recs.length, ms: Date.now() - started, detail: `${state}: ${els.length} mapped features (browser)` }] };
+      } catch { /* try the next endpoint */ } finally { clearTimeout(timer); }
+    }
+    return null;
+  }
+
+  async function connectCloud() {
+    const pass = passInput.trim();
+    if (!pass) return;
+    await syncCloud(pass);
+    setPassInput("");
+  }
+
+  function disconnectCloud() {
+    rememberPasscode("");
+    cloudRef.current.passcode = "";
+    setCloud((x) => ({ ...x, connected: false, error: "" }));
+  }
+
+  async function importImage(file: Blob) {
+    try {
+      setImageStatus("Reading image…");
+      const { dataUrl, base64 } = await imageToJpeg(file);
+      let lines: string[] = [];
+      if (visionReady) {
+        setImageStatus("Reading the listings with AI…");
+        const r = await fetch("/api/research", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "vision", image: base64, mediaType: "image/jpeg" }) });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && Array.isArray(d.lines)) lines = d.lines;
+      }
+      if (!lines.length) {
+        setImageStatus("Recognizing text on this device (first use downloads the OCR engine)…");
+        lines = ocrToFacilityLines(await ocrImage(dataUrl));
+      }
+      if (!lines.length) { setImageStatus("No facility names recognized in that image. Try a sharper or closer screenshot."); return; }
+      setPasteText((t) => `${t.trim() ? `${t.trim()}\n` : ""}${lines.join("\n")}`);
+      setImageStatus(`Found ${lines.length} facilities — check the list below, then click “Add to Lifetime + research”.`);
+    } catch (e) {
+      setImageStatus(`Image import failed: ${e instanceof Error ? e.message : "unknown error"}`);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -451,13 +637,13 @@ export default function Home() {
       const data = JSON.parse(await file.text());
       const records: Prospect[] = Object.values(data.lifetime || {});
       const { changed } = mergeIntoLifetime(lifetimeRef.current, records);
-      await putRecords("lifetime", changed);
+      await persist("lifetime", changed);
       const savedIn: Prospect[] = Object.values(data.saved || {});
       if (savedIn.length) {
         const next = { ...saved };
         for (const s of savedIn) next[s.key] = { ...s, saved: true };
         setSaved(next);
-        await putRecords("saved", savedIn.map((s) => ({ ...s, saved: true })));
+        await persist("saved", savedIn.map((s) => ({ ...s, saved: true })));
       }
       memoryRef.current = { ...(data.memory || {}), ...memoryRef.current };
       await setMeta("memory", memoryRef.current);
@@ -474,7 +660,7 @@ export default function Home() {
     const now = Date.now();
     const { changed, newKeys } = mergeIntoLifetime(lifetimeRef.current, rows);
     for (const k of newKeys) memoryRef.current[k] = memoryRef.current[k] ?? now;
-    await putRecords("lifetime", changed);
+    await persist("lifetime", changed);
     await setMeta("memory", memoryRef.current);
     bumpLifetime();
     setPasteText("");
@@ -546,7 +732,7 @@ export default function Home() {
         </select>
         <label className="inlineCheck"><input type="checkbox" checked={autoResearch} onChange={(e) => setAutoResearch(e.target.checked)} /> Auto-research top new</label>
         <button className="mini" onClick={() => setShowSources((s) => !s)}>{showSources ? "Hide sources" : "Sources"}</button>
-        <span className="progress">{progress || (ready ? "Public records (USDA FSIS, EPA TRI, EPA ECHO, OpenStreetMap) + public web discovery. 100 results per page." : "Loading your Lifetime database… (if this persists, close other Prospecting Engine tabs so the database upgrade can finish)")}</span>
+        <span className="progress">{progress || (ready ? "Public records (EPA RMP, USDA FSIS, EPA TRI, EPA ECHO, OpenStreetMap) + public web discovery. 100 results per page." : "Loading your Lifetime database… (if this persists, close other Prospecting Engine tabs so the database upgrade can finish)")}</span>
       </section>
 
       {showSources && (
@@ -616,12 +802,33 @@ export default function Home() {
       {showTools && (
         <section className="srcPanel tools">
           <div>
-            <div className="srcGroup">Paste a facility list (Google Maps results, spreadsheet rows)</div>
-            <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder={"One facility per line, e.g.\nABC Cold Storage, Tolleson, AZ\nXYZ Meats — 1200 Industrial Way, Yakima, WA 98901"} rows={5} />
-            <button className="mini" onClick={() => void importList()} disabled={running || !pasteText.trim()}>Add to Lifetime + research</button>
+            <div className="srcGroup">Paste a facility list, or a screenshot (Google Maps results, directories, spreadsheets)</div>
+            <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)}
+              onPaste={(e) => { const item = [...e.clipboardData.items].find((i) => i.type.startsWith("image/")); if (item) { e.preventDefault(); const f = item.getAsFile(); if (f) void importImage(f); } }}
+              placeholder={"One facility per line, e.g.\nABC Cold Storage, Tolleson, AZ\nXYZ Meats — 1200 Industrial Way, Yakima, WA 98901\n\n…or paste a screenshot here (Cmd/Ctrl+V)"} rows={6} />
+            <div className="toolRow">
+              <button className="mini" onClick={() => void importList()} disabled={running || !pasteText.trim()}>Add to Lifetime + research</button>
+              <label className="mini fileBtn">Import screenshot / map image<input type="file" accept="image/*" onChange={(e) => { const f = e.target.files?.[0]; if (f) void importImage(f); e.target.value = ""; }} /></label>
+            </div>
+            <p className="muted small">{imageStatus || (visionReady ? "Screenshots are read with AI (ANTHROPIC_API_KEY configured)." : "Screenshots are read with free on-device text recognition.")}</p>
           </div>
           <div>
-            <div className="srcGroup">Backup / move your Lifetime database</div>
+            <div className="srcGroup">Cloud sync</div>
+            {!cloud.status ? <p className="muted small">Checking…</p>
+              : !cloud.status.configured ? (
+                <p className="muted small">Not set up. In Vercel: Storage → connect a Neon Postgres database to this project, and add an <code>APP_PASSCODE</code> environment variable{cloud.status.database ? " (database found — passcode missing)" : cloud.status.passcode ? " (passcode found — database missing)" : ""}. Then Lifetime follows you to any browser.</p>
+              ) : cloud.connected ? (
+                <p className="muted small">Connected · {cloud.syncing ? "syncing…" : cloud.lastSync ? `last synced ${new Date(cloud.lastSync).toLocaleTimeString()}` : "ready"}{" "}
+                  <button className="mini" onClick={() => void syncCloud(cloudRef.current.passcode)} disabled={cloud.syncing}>Sync now</button>{" "}
+                  <button className="mini" onClick={disconnectCloud}>Disconnect</button></p>
+              ) : (
+                <div className="toolRow">
+                  <input className="passInput" type="password" value={passInput} onChange={(e) => setPassInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void connectCloud(); }} placeholder="App passcode" />
+                  <button className="mini" onClick={() => void connectCloud()} disabled={cloud.syncing || !passInput.trim()}>{cloud.syncing ? "Connecting…" : "Connect"}</button>
+                </div>
+              )}
+            {cloud.error && <p className="small errText">{cloud.error}</p>}
+            <div className="srcGroup" style={{ marginTop: 14 }}>Backup / move your Lifetime database</div>
             <p className="muted small">Lifetime is stored in this browser (IndexedDB{persisted ? ", persistent storage granted" : ""}). Use a backup to move it to another browser or computer.</p>
             <button className="mini" onClick={backupJson}>Download backup (.json)</button>{" "}
             <label className="mini fileBtn">Restore backup<input type="file" accept="application/json" onChange={(e) => { const f = e.target.files?.[0]; if (f) void restoreJson(f); e.target.value = ""; }} /></label>
@@ -648,7 +855,7 @@ export default function Home() {
                 <td>{p.city}, {p.state}{p.address ? <div className="sub">{p.address}</div> : null}</td>
                 <td>{p.facilityType}</td>
                 <td className="refCell">{p.refrigeration}</td>
-                <td>{p.ammonia === "Unknown" ? <span className="muted">Unknown</span> : p.ammonia === "None indicated" ? "Not indicated" : p.ammonia}{p.ammoniaLb != null && p.ammoniaLb >= 10000 ? <em className="badge amm">≥10k lb doc.</em> : null}</td>
+                <td>{p.ammonia === "Unknown" ? <span className="muted">Unknown</span> : p.ammonia === "None indicated" ? "Not indicated" : p.ammonia}{p.ammoniaLb != null && p.ammoniaLb >= 10000 ? <em className="badge amm" title={`${p.ammoniaLb.toLocaleString()} lb documented`}>≥10k lb</em> : null}</td>
                 <td>{p.evidenceSources || (p.sourceUrls || []).length || 0}<div className="sub">{p.confidence}</div></td>
                 <td><span className={`priority p${p.priority}`}>{p.priority}</span></td>
                 <td><button className={saved[p.key] ? "saveBtn saved" : "saveBtn"} onClick={(e) => { e.stopPropagation(); void toggleSaved(p); }}>{saved[p.key] ? "★" : "☆"}</button></td>

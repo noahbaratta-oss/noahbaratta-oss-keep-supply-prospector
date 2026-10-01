@@ -92,6 +92,7 @@ export function buildPlan(opts: PlanOptions): DiscoverTask[] {
   const fsis = on("fsis") && fsisModeFor(targets) !== "none";
   const naicsChunks = chunk(naicsFor(targets), 6);
   for (const state of states) {
+    if (on("rmp")) tasks.push({ id: `rmp-${state}`, kind: "rmp", state, label: `EPA RMP ammonia registrations · ${state}` });
     if (fsis) tasks.push({ id: `fsis-${state}`, kind: "fsis", states: [state], label: `USDA FSIS inspected establishments · ${state}` });
     if (on("tri")) tasks.push({ id: `tri-${state}`, kind: "tri", state, label: `EPA TRI ammonia reporters · ${state}` });
     if (on("echo")) naicsChunks.forEach((naics, i) => tasks.push({ id: `echo-${state}-${i}`, kind: "echo", state, naics, label: `EPA ECHO facilities · ${state} · NAICS group ${i + 1}/${naicsChunks.length}` }));

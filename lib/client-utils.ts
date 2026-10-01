@@ -73,7 +73,7 @@ export function parseFacilityList(text: string, fallbackState: string): Prospect
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.replace(/\s+/g, " ").trim();
     if (line.length < 3 || /^(rating|reviews?|open|closed|directions|website|\d(\.\d)?\s*\(\d+\))/i.test(line)) continue;
-    const parts = line.split(/\t| — | – | - |,|\|/).map((s) => s.trim()).filter(Boolean);
+    const parts = rawLine.split(/\t| — | – | - |,|\|/).map((x) => x.replace(/\s+/g, " ").trim()).filter(Boolean);
     if (!parts.length) continue;
     const name = parts[0];
     let state = detectState(line, "");
@@ -81,8 +81,11 @@ export function parseFacilityList(text: string, fallbackState: string): Prospect
     if (state === "Unknown" && abbr) state = ABBR_STATE[abbr[1]];
     if (state === "Unknown") state = (WESTERN_STATES as readonly string[]).includes(fallbackState) ? fallbackState : "Unknown";
     const stIdx = parts.findIndex((p) => /^(AZ|CA|CO|ID|MT|NV|NM|OR|UT|WA|WY|AK|HI)(\s+\d{5})?$/.test(p) || (WESTERN_STATES as readonly string[]).includes(p));
-    const city = stIdx > 1 ? parts[stIdx - 1] : parts.length >= 2 && !/\d/.test(parts[1]) ? parts[1] : "Unknown";
-    const street = parts.slice(1, stIdx > 1 ? stIdx - 1 : 1).find((p) => /^\d+\s+\w+/.test(p));
+    const streetIdx = parts.findIndex((p, i) => i > 0 && /^\d+\s+\w+/.test(p));
+    const street = streetIdx > 0 ? parts[streetIdx] : undefined;
+    const city = stIdx > 1 && stIdx - 1 !== streetIdx ? parts[stIdx - 1]
+      : streetIdx > 0 && parts[streetIdx + 1] && !/\d/.test(parts[streetIdx + 1]) && streetIdx + 1 !== stIdx ? parts[streetIdx + 1]
+        : streetIdx < 0 && parts.length >= 2 && !/\d/.test(parts[1]) && stIdx !== 1 ? parts[1] : "Unknown";
     const zip = line.match(/\b(\d{5})(?:-\d{4})?\b/)?.[1];
     const type = classifyFacility(line);
     const p: Prospect = {

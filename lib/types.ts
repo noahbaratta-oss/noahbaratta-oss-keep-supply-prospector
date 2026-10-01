@@ -79,6 +79,7 @@ export type ProviderLog = {
 export type DiscoverTask =
   | { id: string; kind: "fsis"; states: string[]; label: string }
   | { id: string; kind: "tri"; state: string; label: string }
+  | { id: string; kind: "rmp"; state: string; label: string }
   | { id: string; kind: "echo"; state: string; naics: string[]; label: string }
   | { id: string; kind: "osm"; state: string; label: string }
   | { id: string; kind: "web"; state: string; queries: string[]; label: string };

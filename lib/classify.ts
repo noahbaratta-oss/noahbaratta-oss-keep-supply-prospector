@@ -82,9 +82,43 @@ export function classifyFacility(text: string): { type: string; base: number; bu
   return hit ? { type: hit.type, base: hit.base, buyer: hit.buyer } : { type: UNCLASSIFIED, base: 35, buyer: "Maintenance Manager" };
 }
 
+// NAICS prefix → facility type, most specific first. Handles 5- and 6-digit codes
+// (RMP and ECHO often report 5-digit industry groups such as 49312 or 31161).
+const NAICS_TYPES: Array<[RegExp, string]> = [
+  [/^311613/, "Rendering"],
+  [/^311615/, "Poultry Processing"],
+  [/^31161/, "Meat / Protein Processing"],
+  [/^311520|^31152/, "Ice Cream / Frozen Dessert"],
+  [/^3115/, "Dairy Processing"],
+  [/^3117/, "Seafood Processing"],
+  [/^3114/, "Frozen Food / Produce Processing"],
+  [/^312113/, "Ice Manufacturing"],
+  [/^31212/, "Brewery"],
+  [/^31213/, "Winery"],
+  [/^31214/, "Distillery"],
+  [/^3121/, "Beverage / Bottling"],
+  [/^115114|^11511/, "Produce Packing / Storage"],
+  [/^424480|^42448/, "Produce Packing / Storage"],
+  [/^4931/, "Cold Storage / Refrigerated Warehouse"],
+  [/^4244|^4245/, "Food Distribution Center"],
+  [/^424810|^424820|^4248/, "Beverage / Bottling"],
+  [/^424210|^42421/, "Pharma Distribution / Cold Chain"],
+  [/^3254/, "Pharma / Life Sciences Manufacturing"],
+  [/^311/, "Food Ingredient / Other Food Manufacturing"],
+  [/^325120|^32512/, "Chemical / Industrial Gas"],
+  [/^325/, "Chemical / Industrial Gas"],
+  [/^326/, "Plastics / Rubber Manufacturing"],
+];
+
 export function facilityTypeFromNaics(codes: string[]): { type: string; base: number; buyer: string } {
-  const joined = codes.join(" ");
-  return classifyFacility(joined);
+  const clean = codes.map((c) => String(c).replace(/\D/g, "")).filter(Boolean);
+  for (const [re, type] of NAICS_TYPES) {
+    if (clean.some((c) => re.test(c))) {
+      const f = FACILITY_TYPES.find((x) => x.type === type);
+      if (f) return { type: f.type, base: f.base, buyer: f.buyer };
+    }
+  }
+  return classifyFacility(clean.join(" "));
 }
 
 // ---------------------------------------------------------------------------
@@ -189,12 +223,15 @@ export function scoreProspect(p: Prospect): { score: number; priority: Priority;
   let score = baseForType(p.facilityType);
   const reasons: string[] = [p.facilityType];
 
+  const rmp = has(ev, /EPA RMP: .*ammonia/i);
   const tri = has(ev, /EPA TRI: ammonia/i);
-  if (tri) { score += 18; reasons.push("ammonia reported to EPA TRI"); }
+  if (rmp) { score += 16; reasons.push("ammonia registered under EPA RMP"); }
+  else if (tri) { score += 18; reasons.push("ammonia reported to EPA TRI"); }
   else if (p.ammonia === "Confirmed") { score += 12; reasons.push("ammonia confirmed in public record"); }
   else if (p.ammonia === "Likely") { score += 6; reasons.push("ammonia likely"); }
 
   if (p.ammoniaLb && p.ammoniaLb >= 10000) { score += 10; reasons.push(`${p.ammoniaLb.toLocaleString()} lb ammonia documented`); }
+  if (rmp && tri) score += 4;
   if (/industrial refrigeration|ammonia|co2|refrigerated/i.test(p.refrigeration) && !/candidate|verify|unknown/i.test(p.refrigeration)) score += 6;
   if (p.co2) { score += 4; reasons.push("CO₂ refrigeration signal"); }
   if ((p.equipmentBrands || []).length) score += 4;
@@ -208,6 +245,7 @@ export function scoreProspect(p: Prospect): { score: number; priority: Priority;
   const providers = new Set(p.providers || []);
   score += Math.min(12, Math.max(0, providers.size - 1) * 4);
   if (providers.size === 1 && providers.has("Web search") && (p.evidence || []).length <= 1) score -= 5;
+  if (/\b(property|properties|parcel|vacant|former|apartments?|shopping|plaza|residence|condominium|church|school|county of|city of)\b/i.test(p.name) && !rmp && !tri) score -= 12; // site/property records, not operating plants
   if (/^\d+\s+(\w+\s+){0,3}(st|street|ave|avenue|rd|road|blvd|boulevard|way|dr|drive|ln|lane|hwy|highway|pkwy|parkway|ct|court|pl|place|loop|cir|circle)\b/i.test(p.name)) score -= 10; // registry name is a street address
 
   if (p.inSeedList) {

@@ -7,67 +7,17 @@
 
 import type { Evidence, Prospect, ProviderLog } from "./types";
 import { cached, csvObjects, fetchText } from "./http";
-import { classifyFacility, facilityKey, facilityTypeFromNaics, finalize, UNCLASSIFIED } from "./classify";
+import { classifyFacility, facilityTypeFromNaics, UNCLASSIFIED } from "./classify";
 import { ABBR_STATE, STATE_ABBR, titleCase } from "./geo";
-import { DEFAULT_TARGETS, TARGET_DEFS, defFor, fsisModeFor, naicsFor, osmClausesFor } from "./target-filters";
-import { crossReferenceSeed } from "./merge";
+import { DEFAULT_TARGETS, fsisModeFor, naicsFor } from "./target-filters";
+import { allowedTypes, makeRecord, num, targetsMatching } from "./targeting";
+import { OVERPASS_ENDPOINTS, osmElementsToRecords, osmQuery, type OsmElement } from "./osm";
 import FSIS_SNAPSHOT from "./fsis-west.json";
 
 type Result = { records: Prospect[]; log: ProviderLog; rawHits: number };
 
-const SIGNAL_TARGETS = new Set(["Ammonia", "Industrial refrigeration", "Cold storage", "CO₂ refrigeration", "Production facility", "Large-scale manufacturing", "Industrial production facilities", "Process cooling facilities", "Packaging line", "Distribution center"]);
-
-// Facility types allowed by the selected targets (null = allow all).
-export function allowedTypes(targets: string[]): Set<string> | null {
-  if (!targets.length || targets.some((t) => SIGNAL_TARGETS.has(t))) return null;
-  const types = new Set<string>();
-  for (const t of targets) {
-    const def = defFor(t);
-    if (def.naics?.length) for (const code of def.naics) types.add(facilityTypeFromNaics([code]).type);
-    types.add(classifyFacility(`${t} ${def.aliases.join(" ")}`).type);
-    if (def.fsis) { types.add("Meat / Protein Processing"); types.add("Poultry Processing"); }
-  }
-  types.delete(UNCLASSIFIED);
-  return types;
-}
-
-export function targetsMatching(targets: string[], codes: string[], type: string): string[] {
-  const list = targets.length ? targets : DEFAULT_TARGETS;
-  return list.filter((t) => {
-    const def = TARGET_DEFS[t];
-    if (!def) return false;
-    if (def.naics?.some((c) => codes.some((x) => x.startsWith(c)))) return true;
-    return classifyFacility(`${t} ${def.aliases.join(" ")}`).type === type;
-  }).slice(0, 6);
-}
-
-function base(partial: Partial<Prospect> & Pick<Prospect, "name" | "city" | "state" | "facilityType">): Prospect {
-  const p: Prospect = {
-    key: "",
-    industry: partial.facilityType,
-    refrigeration: "Needs verification",
-    ammonia: "Unknown",
-    ammoniaLb: null,
-    evidence: [],
-    sourceUrls: [],
-    providers: [],
-    evidenceSources: 0,
-    confidence: "Low",
-    score: 0,
-    priority: "C",
-    reason: "",
-    firstSeen: Date.now(),
-    lastSeen: Date.now(),
-    ...partial,
-  };
-  p.key = facilityKey(p);
-  return finalize(crossReferenceSeed(p));
-}
-
-const num = (v: unknown) => {
-  const n = Number(v);
-  return Number.isFinite(n) && n !== 0 ? n : undefined;
-};
+export { allowedTypes, targetsMatching } from "./targeting";
+const base = makeRecord;
 
 // ---------------------------------------------------------------------------
 // USDA FSIS MPI Directory
@@ -328,56 +278,18 @@ export async function echoProvider(state: string, naics: string[], targets: stri
 // OpenStreetMap via Overpass
 // ---------------------------------------------------------------------------
 
-const OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"];
-
 export async function osmProvider(state: string, targets: string[]): Promise<Result> {
   const started = Date.now();
-  const abbr = STATE_ABBR[state];
-  const clauses = osmClausesFor(targets.length ? targets : DEFAULT_TARGETS);
-  if (!clauses.length) return { records: [], rawHits: 0, log: { provider: "OpenStreetMap", ok: true, status: "skipped", count: 0, ms: 0, detail: "No map tags for selected targets" } };
-  const query = `[out:json][timeout:22];area["ISO3166-2"="US-${abbr}"]->.a;(${clauses.map((c) => `${c}(area.a);`).join("")});out center tags 1500;`;
+  const query = osmQuery(state, targets);
+  if (!query) return { records: [], rawHits: 0, log: { provider: "OpenStreetMap", ok: true, status: "skipped", count: 0, ms: 0, detail: "No map tags for selected targets" } };
   let lastErr = "";
-  for (const [i, endpoint] of OVERPASS.entries()) {
+  for (const [i, endpoint] of OVERPASS_ENDPOINTS.entries()) {
     const r = await fetchText(endpoint, { method: "POST", body: `data=${encodeURIComponent(query)}`, headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: i === 0 ? 25000 : 20000 });
     if (!r.ok) { lastErr = r.error || `HTTP ${r.status}`; continue; }
     try {
-      const j = JSON.parse(r.text);
-      const els: Array<{ type: string; id: number; lat?: number; lon?: number; center?: { lat: number; lon: number }; tags?: Record<string, string> }> = j.elements || [];
-      const allowed = allowedTypes(targets);
-      const records: Prospect[] = [];
-      for (const el of els) {
-        const t = el.tags || {};
-        const name = t.name || t.operator || t.brand;
-        if (!name) continue;
-        if (t.shop || /^(restaurant|bar|pub|cafe|fast_food)$/.test(t.amenity || "")) continue;
-        const tagSummary = ["industrial", "craft", "man_made", "product", "building", "office"].filter((k) => t[k]).map((k) => `${k}=${t[k]}`).join(", ");
-        const type = classifyFacility(`${name} ${t.industrial || ""} ${t.craft || ""} ${t.product || ""}`);
-        if (type.type === UNCLASSIFIED && !/refrigerat|cold|freez/i.test(name)) continue;
-        if (allowed && !allowed.has(type.type)) continue;
-        const url = `https://www.openstreetmap.org/${el.type}/${el.id}`;
-        const street = [t["addr:housenumber"], t["addr:street"]].filter(Boolean).join(" ");
-        records.push(base({
-          recordId: `osm:${el.type}/${el.id}`,
-          name,
-          facilityName: t.operator && t.operator !== name ? `${name} (operator: ${t.operator})` : undefined,
-          city: t["addr:city"] || "Unknown",
-          state,
-          address: street || undefined,
-          zip: t["addr:postcode"],
-          phone: t.phone || t["contact:phone"] || undefined,
-          website: t.website || t["contact:website"] || undefined,
-          lat: el.lat ?? el.center?.lat,
-          lon: el.lon ?? el.center?.lon,
-          facilityType: type.type,
-          industry: `${type.type} (OpenStreetMap: ${tagSummary || "named feature"})`,
-          evidence: [{ label: `OpenStreetMap mapped facility (${tagSummary || "named industrial feature"})`, url, source: "OpenStreetMap (community data)", kind: "osm" }],
-          sourceUrls: [url],
-          providers: ["OpenStreetMap"],
-          targetCategories: targetsMatching(targets, [], type.type),
-          source: "OpenStreetMap",
-        }));
-      }
-      return { records, rawHits: els.length, log: { provider: "OpenStreetMap", ok: true, status: records.length ? "ok" : "empty", count: records.length, ms: Date.now() - started, detail: `${state}: ${els.length} mapped features` } };
+      const els: OsmElement[] = JSON.parse(r.text).elements || [];
+      const records = osmElementsToRecords(els, state, targets);
+      return { records, rawHits: els.length, log: { provider: "OpenStreetMap", ok: true, status: records.length ? "ok" : "empty", count: records.length, ms: Date.now() - started, detail: `${state}: ${els.length} mapped features (server)` } };
     } catch (e) {
       lastErr = e instanceof Error ? e.message : "bad response";
     }

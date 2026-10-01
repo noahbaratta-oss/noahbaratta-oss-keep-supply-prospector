@@ -65,3 +65,7 @@
 .filterItem small{display:block;font-size:10px;color:#6f8274;margin-top:3px}
 .grow{flex:1}
 @media(max-width:900px){.srcGrid,.tools{grid-template-columns:1fr}.toolbar{flex-wrap:wrap}.filterControls{grid-template-columns:1fr}}
+.toolRow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:4px 0}
+.passInput{height:30px;border:1px solid #27422d;border-radius:6px;background:#07110a;color:#e5f3e8;font:inherit;padding:0 10px;min-width:180px}
+.errText{color:#ff9b9b}
+.drawer code,.srcPanel code{background:#0b1b10;border:1px solid #1f3824;border-radius:4px;padding:0 4px;color:#8ce29a}
