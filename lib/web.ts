@@ -5,7 +5,7 @@
 import type { Evidence, Prospect, ProviderLog } from "./types";
 import { fetchText, looksBlocked } from "./http";
 import { classifyFacility, facilityKey, finalize, isNonFacilityText, isRelevantWebText, normName, refrigerationLabel, textSignals, UNCLASSIFIED } from "./classify";
-import { detectCity, detectState, isWesternState } from "./geo";
+import { STATE_ABBR, detectCity, detectState, isWesternState } from "./geo";
 import { crossReferenceSeed } from "./merge";
 import { targetsMatching } from "./targeting";
 
@@ -290,7 +290,13 @@ export function hitToRecord(hit: Hit, _stateHint: string, targets: string[]): Pr
   if (!isRelevantWebText(text)) return null;
   const type = classifyFacility(text);
   if (type.type === UNCLASSIFIED && !sig.refrigerationHits && !sig.ammonia) return null;
-  const city = detectCity(text, state);
+  // Ignore city names that are only part of the company name ("Payette Brewing" is in Boise, not Payette),
+  // unless the source also writes that city as a location ("Americold Burley, ID").
+  let city = detectCity(text.split(name).join(" "), state);
+  if (city === "Unknown") {
+    const inName = detectCity(text, state);
+    if (inName !== "Unknown" && new RegExp(`\\b${inName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")},\\s*(${STATE_ABBR[state]}|${state})\\b`, "i").test(text)) city = inName;
+  }
   const domain = domainName(hit.url);
   const kind: Evidence["kind"] = /\.pdf($|\?)/i.test(hit.url) ? "document" : /\.(gov|us)$|\.gov\//i.test(domain) ? "government" : "web";
   const evidence: Evidence[] = [{ label: `${kind === "document" ? "Public document" : kind === "government" ? "Government web page" : "Web result"} (${hit.engine}): ${title.slice(0, 140)}`, detail: hit.snippet.slice(0, 400) || undefined, url: hit.url, source: "Web search", kind }];
